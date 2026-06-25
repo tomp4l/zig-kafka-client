@@ -15,10 +15,9 @@ test "ApiVersionsRequestV5" {
     var allocating: AllocatingWriter = .init(allocator);
     defer allocating.deinit();
 
-    const size = try request.serialise(&allocating.writer);
+    try request.serialise(&allocating.writer);
 
     const bytes = allocating.written();
-    try std.testing.expectEqual(bytes.len, size);
 
     const expected_bytes = &[_]u8{
         0x04, 0x61, 0x62, 0x63, // "abc"
@@ -29,4 +28,8 @@ test "ApiVersionsRequestV5" {
     };
 
     try std.testing.expectEqualSlices(u8, expected_bytes, bytes);
+
+    try std.testing.expectEqual(18, protocol.ApiVersionsRequestV5.api_key);
+    try std.testing.expectEqual(true, protocol.ApiVersionsRequestV5.is_flexible);
+    try std.testing.expectEqual(5, protocol.ApiVersionsRequestV5.version);
 }

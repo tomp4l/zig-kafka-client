@@ -161,14 +161,12 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !v
     try output_file.writeStreamingAll(io, "const std = @import(\"std\");");
 
     try output_file.writeStreamingAll(io,
-        \\ fn writeUnsignedVarInt(writer: *std.Io.Writer, value: usize) !usize {
+        \\ fn writeUnsignedVarInt(writer: *std.Io.Writer, value: usize) !void {
         \\     var temp = value;
-        \\     var size: usize = 0;
         \\     while (true) {
         \\         var byte: u8 = @intCast(temp & 0x7F);
         \\ 
         \\         temp >>= 7;
-        \\         size+=1; 
         \\         if (temp != 0) {
         \\             byte |= 0x80;
         \\             try writer.writeByte(byte);
@@ -177,7 +175,6 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !v
         \\             break;
         \\         }
         \\     }
-        \\     return size;
         \\ } 
     );
 
@@ -304,8 +301,8 @@ fn generateStructVersion(
     try output_file.writeStreamingAll(io, "= struct {");
 
     try output_file.writeStreamingAll(io, "pub const api_key = ");
-    const apiKey = std.fmt.printInt(&print_buffer, protocol_json.apiKey, 10, .lower, .{});
-    try output_file.writeStreamingAll(io, print_buffer[0..apiKey]);
+    const api_key_length = std.fmt.printInt(&print_buffer, protocol_json.apiKey, 10, .lower, .{});
+    try output_file.writeStreamingAll(io, print_buffer[0..api_key_length]);
 
     try output_file.writeStreamingAll(io, ";");
 
@@ -314,6 +311,12 @@ fn generateStructVersion(
 
     try output_file.writeStreamingAll(io, "pub const is_flexible = ");
     try output_file.writeStreamingAll(io, if (is_flexible) "true;" else "false;");
+
+    try output_file.writeStreamingAll(io, "pub const version = ");
+    const version_length = std.fmt.printInt(&print_buffer, version, 10, .lower, .{});
+    try output_file.writeStreamingAll(io, print_buffer[0..version_length]);
+
+    try output_file.writeStreamingAll(io, ";");
 
     for (protocol_json.fields) |field| {
         try mapSubtype(io, arena, field, version, output_file);
@@ -326,10 +329,68 @@ fn generateStructVersion(
     if (is_request) {
         try createSerialise(io, arena, protocol_json, version, is_flexible, output_file);
     } else {
-        //add deserialise
+        // try createDeserialise(io, arena, protocol_json, version, is_flexible, output_file);
     }
 
     try output_file.writeStreamingAll(io, "};");
+}
+
+fn createDeserialise(
+    io: Io,
+    arena: std.mem.Allocator,
+    protocol_json: ProtocolJson,
+    version: usize,
+    is_flexible: bool,
+    output_file: Io.File,
+) !void {
+    try output_file.writeStreamingAll(io,
+        \\ pub fn deserialise(self: *const @This(), allocator: std.mem.Allocator, bytes: [] const u8) !void {
+        \\
+    );
+
+    for (protocol_json.fields) |field| {
+        const field_versions = try VersionRange.parse(field.versions);
+        if (field_versions.contains(version)) {
+            _ = is_flexible;
+            _ = arena;
+            // try createDeserialiseField(io, arena, field, version, is_flexible, output_file);
+        }
+    }
+
+    try output_file.writeStreamingAll(io,
+        \\ }
+        \\
+    );
+}
+
+fn createDeserialiseField(
+    io: Io,
+    arena: std.mem.Allocator,
+    field: ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    output_file: Io.File,
+) !void {
+    _ = arena;
+    _ = io;
+    _ = version;
+    _ = is_flexible;
+    _ = output_file;
+
+    const kafka_type = field.type;
+    if (std.mem.eql(u8, kafka_type, "int8")) @panic("int");
+    if (std.mem.eql(u8, kafka_type, "int16")) @panic("int");
+    if (std.mem.eql(u8, kafka_type, "int32")) @panic("int");
+    if (std.mem.eql(u8, kafka_type, "int64")) @panic("int");
+    if (std.mem.eql(u8, kafka_type, "bool")) @panic("bool");
+    if (std.mem.eql(u8, kafka_type, "string")) @panic("string");
+    if (std.mem.eql(u8, kafka_type, "bytes")) @panic("bytes");
+    if (std.mem.eql(u8, kafka_type, "records")) @panic("records");
+    if (std.mem.eql(u8, kafka_type, "uuid")) @panic("uuid");
+    if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
+
+    // Fallback for custom nested arrays (e.g. "[]Topic")
+    @panic(kafka_type);
 }
 
 fn createSerialise(
@@ -341,8 +402,7 @@ fn createSerialise(
     output_file: Io.File,
 ) !void {
     try output_file.writeStreamingAll(io,
-        \\ pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !usize {
-        \\   var size: usize = 0;
+        \\ pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
         \\
     );
     var has_field = false;
@@ -357,19 +417,16 @@ fn createSerialise(
     if (!has_field) {
         try output_file.writeStreamingAll(io,
             \\   _ = self;
-            \\   size = 0;
         );
     }
 
     if (is_flexible) {
         // todo proper flexible handling
         try output_file.writeStreamingAll(io, "try writer.writeByte(0x00);");
-        try output_file.writeStreamingAll(io, "size += 1;");
     }
 
     try output_file.writeStreamingAll(io,
         \\   try writer.flush();
-        \\   return size;
         \\ }
     );
 }
@@ -441,7 +498,6 @@ fn createSerialiseInt(
 
     try output_file.writeStreamingAll(io,
         \\, .big);
-        \\   size += buf.len;
         \\   try writer.writeAll(&buf);
         \\ }
     );
@@ -472,36 +528,29 @@ fn createSerialiseBytes(
     }
 
     if (is_flexible) {
-        try output_file.writeStreamingAll(io, "size += try writeUnsignedVarInt(writer, field.len + 1);");
+        try output_file.writeStreamingAll(io, "try writeUnsignedVarInt(writer, field.len + 1);");
     } else {
         // Legacy needs to differentiate between string vs bytes/records
         if (std.mem.eql(u8, field.type, "string")) {
-            try output_file.writeStreamingAll(io, "size += 2");
-
             try output_file.writeStreamingAll(io, "try writer.writeInt(i16, @intCast(field.len), .big);");
         } else {
-            try output_file.writeStreamingAll(io, "size += 4");
-
             // "bytes" and "records"
             try output_file.writeStreamingAll(io, "try writer.writeInt(i32, @intCast(field.len), .big);");
         }
     }
 
-    try output_file.writeStreamingAll(io, "size += field.len;");
     try output_file.writeStreamingAll(io, "try writer.writeAll(field);}");
 
     if (is_nullable) {
         try output_file.writeStreamingAll(io, "else {");
 
         if (is_flexible) {
-            try output_file.writeStreamingAll(io, "size += try writeUnsignedVarInt(writer, 0);");
+            try output_file.writeStreamingAll(io, "try writeUnsignedVarInt(writer, 0);");
         } else {
             // Legacy needs to differentiate between string vs bytes/records
             if (std.mem.eql(u8, field.type, "string")) {
-                try output_file.writeStreamingAll(io, "size += 2");
                 try output_file.writeStreamingAll(io, "try writer.writeInt(i16, -1, .big);");
             } else {
-                try output_file.writeStreamingAll(io, "size += 4");
                 // "bytes" and "records"
                 try output_file.writeStreamingAll(io, "try writer.writeInt(i32, -1, .big);");
             }

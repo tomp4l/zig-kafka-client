@@ -2,4 +2,8 @@
 const std = @import("std");
 const Io = std.Io;
 
-pub const Client = @import("Client.zig");
+pub const BrokerConnection = @import("BrokerConnection.zig");
+
+test {
+    std.testing.refAllDecls(@This());
+}
