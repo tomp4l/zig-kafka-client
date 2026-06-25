@@ -58,12 +58,23 @@ const ProtocolField = struct {
     versions: []const u8,
     ignorable: bool = false,
     about: []const u8,
-    fields: []const ProtocolField = &.{},
+    fields: []ProtocolField = &.{},
     tag: ?usize = null,
     taggedVersions: ?[]const u8 = null,
     nullableVersions: ?[]const u8 = null,
     mapKey: bool = false,
-    default: std.json.Value = .null,
+    default: ?std.json.Value = null,
+
+    // generated field
+    snake_name: []const u8 = undefined,
+
+    fn populateGeneratedFields(self: *ProtocolField, arena: std.mem.Allocator) !void {
+        self.snake_name = try toSnakeCase(arena, self.name);
+
+        for (self.fields) |*field| {
+            try field.populateGeneratedFields(arena);
+        }
+    }
 };
 
 const VersionRange = union(enum) {
@@ -111,7 +122,7 @@ const ProtocolJson = struct {
     validVersions: []const u8,
     flexibleVersions: []const u8,
     latestVersionUnstable: bool = false,
-    fields: []const ProtocolField,
+    fields: []ProtocolField,
 
     const VersionsIterator = struct {
         next_version: usize,
@@ -138,9 +149,38 @@ const ProtocolJson = struct {
             .single => |v| return .{ .next_version = v, .max_version = v },
         }
     }
+
+    fn populateGeneratedFields(self: *ProtocolJson, arena: std.mem.Allocator) !void {
+        for (self.fields) |*field| {
+            try field.populateGeneratedFields(arena);
+        }
+    }
 };
 
 fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !void {
+    try output_file.writeStreamingAll(io, "const std = @import(\"std\");");
+
+    try output_file.writeStreamingAll(io,
+        \\ fn writeUnsignedVarInt(writer: *std.Io.Writer, value: usize) !usize {
+        \\     var temp = value;
+        \\     var size: usize = 0;
+        \\     while (true) {
+        \\         var byte: u8 = @intCast(temp & 0x7F);
+        \\ 
+        \\         temp >>= 7;
+        \\         size+=1; 
+        \\         if (temp != 0) {
+        \\             byte |= 0x80;
+        \\             try writer.writeByte(byte);
+        \\         } else {
+        \\             try writer.writeByte(byte);
+        \\             break;
+        \\         }
+        \\     }
+        \\     return size;
+        \\ } 
+    );
+
     var inputs = try Io.Dir.cwd().openDir(io, "protocol", .{ .iterate = true });
     std.log.debug("protocol input dir: {s}", .{try inputs.realPathFileAlloc(io, ".", arena)});
 
@@ -188,14 +228,17 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !v
         var scanner = std.json.Scanner.initCompleteInput(arena, file_content.items);
         var diagnostics = std.json.Scanner.Diagnostics{};
         scanner.enableDiagnostics(&diagnostics);
-        const json = std.json.parseFromTokenSourceLeaky(ProtocolJson, arena, &scanner, .{
+        var json = std.json.parseFromTokenSourceLeaky(ProtocolJson, arena, &scanner, .{
             .ignore_unknown_fields = false,
+            .parse_numbers = true,
         }) catch |err| {
             std.log.err("failed to parse json '{s}': {}", .{ file_content.items[diagnostics.getByteOffset() -| 20 .. diagnostics.getByteOffset() + 20], err });
             std.log.err("                                          ^", .{});
 
             return err;
         };
+
+        try json.populateGeneratedFields(arena);
 
         try generateStructVersions(io, arena, json, output_file);
     }
@@ -220,7 +263,7 @@ fn mapKafkaType(kafka_type: []const u8) []const u8 {
     if (std.mem.eql(u8, kafka_type, "uuid")) return "[16]u8";
     if (std.mem.eql(u8, kafka_type, "float64")) return "f64";
 
-    // Fallback for custom nested arrays (e.g., "[]Topic")
+    // Fallback for custom nested arrays (e.g. "[]Topic")
     return kafka_type;
 }
 
@@ -280,7 +323,192 @@ fn generateStructVersion(
         try mapField(io, arena, field, version, output_file);
     }
 
+    if (is_request) {
+        try createSerialise(io, arena, protocol_json, version, is_flexible, output_file);
+    } else {
+        //add deserialise
+    }
+
     try output_file.writeStreamingAll(io, "};");
+}
+
+fn createSerialise(
+    io: Io,
+    arena: std.mem.Allocator,
+    protocol_json: ProtocolJson,
+    version: usize,
+    is_flexible: bool,
+    output_file: Io.File,
+) !void {
+    try output_file.writeStreamingAll(io,
+        \\ pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !usize {
+        \\   var size: usize = 0;
+        \\
+    );
+    var has_field = false;
+    for (protocol_json.fields) |field| {
+        const field_versions = try VersionRange.parse(field.versions);
+        if (field_versions.contains(version)) {
+            has_field = true;
+            try createSerialiseField(io, arena, field, version, is_flexible, output_file);
+        }
+    }
+
+    if (!has_field) {
+        try output_file.writeStreamingAll(io,
+            \\   _ = self;
+            \\   size = 0;
+        );
+    }
+
+    if (is_flexible) {
+        // todo proper flexible handling
+        try output_file.writeStreamingAll(io, "try writer.writeByte(0x00);");
+        try output_file.writeStreamingAll(io, "size += 1;");
+    }
+
+    try output_file.writeStreamingAll(io,
+        \\   try writer.flush();
+        \\   return size;
+        \\ }
+    );
+}
+
+fn createSerialiseField(
+    io: Io,
+    arena: std.mem.Allocator,
+    field: ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    output_file: Io.File,
+) !void {
+    _ = arena;
+
+    const kafka_type = field.type;
+    if (std.mem.eql(u8, kafka_type, "int8"))
+        return createSerialiseInt(i8, io, field, output_file);
+    if (std.mem.eql(u8, kafka_type, "int16"))
+        return createSerialiseInt(i16, io, field, output_file);
+    if (std.mem.eql(u8, kafka_type, "int32"))
+        return createSerialiseInt(i32, io, field, output_file);
+    if (std.mem.eql(u8, kafka_type, "int64"))
+        return createSerialiseInt(i64, io, field, output_file);
+    if (std.mem.eql(u8, kafka_type, "bool")) @panic("bool");
+    if (std.mem.eql(u8, kafka_type, "string"))
+        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+    if (std.mem.eql(u8, kafka_type, "bytes"))
+        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+    if (std.mem.eql(u8, kafka_type, "records"))
+        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+    if (std.mem.eql(u8, kafka_type, "uuid")) @panic("uuid");
+    if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
+
+    // Fallback for custom nested arrays (e.g. "[]Topic")
+    @panic(kafka_type);
+}
+
+fn createSerialiseInt(
+    T: type,
+    io: Io,
+    field: ProtocolField,
+    output_file: Io.File,
+) !void {
+    try output_file.writeStreamingAll(io,
+        \\ {
+        \\   var buf: [
+    );
+    const size = switch (@sizeOf(T)) {
+        1 => "1",
+        2 => "2",
+        4 => "4",
+        8 => "8",
+        else => @compileError(std.fmt.comptimePrint("Unsupported size: {}", .{@sizeOf(T)})),
+    };
+    try output_file.writeStreamingAll(io, size);
+    try output_file.writeStreamingAll(io,
+        \\]u8 = undefined;
+        \\  std.mem.writeInt(
+    );
+
+    var type_buffer: [3]u8 = undefined;
+    const type_name = try std.fmt.bufPrint(&type_buffer, "{}", .{T});
+
+    try output_file.writeStreamingAll(io, type_name);
+
+    try output_file.writeStreamingAll(io, ", &buf, self.");
+
+    try output_file.writeStreamingAll(io, field.snake_name);
+
+    try output_file.writeStreamingAll(io,
+        \\, .big);
+        \\   size += buf.len;
+        \\   try writer.writeAll(&buf);
+        \\ }
+    );
+}
+
+fn createSerialiseBytes(
+    io: Io,
+    field: ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    output_file: Io.File,
+) !void {
+    const is_nullable = if (field.nullableVersions) |n|
+        (try VersionRange.parse(n)).contains(version)
+    else
+        false;
+
+    if (is_nullable) {
+        try output_file.writeStreamingAll(io, "if(self.");
+    } else {
+        try output_file.writeStreamingAll(io, "{const field = self.");
+    }
+    try output_file.writeStreamingAll(io, field.snake_name);
+    if (is_nullable) {
+        try output_file.writeStreamingAll(io, ") |field| {");
+    } else {
+        try output_file.writeStreamingAll(io, ";");
+    }
+
+    if (is_flexible) {
+        try output_file.writeStreamingAll(io, "size += try writeUnsignedVarInt(writer, field.len + 1);");
+    } else {
+        // Legacy needs to differentiate between string vs bytes/records
+        if (std.mem.eql(u8, field.type, "string")) {
+            try output_file.writeStreamingAll(io, "size += 2");
+
+            try output_file.writeStreamingAll(io, "try writer.writeInt(i16, @intCast(field.len), .big);");
+        } else {
+            try output_file.writeStreamingAll(io, "size += 4");
+
+            // "bytes" and "records"
+            try output_file.writeStreamingAll(io, "try writer.writeInt(i32, @intCast(field.len), .big);");
+        }
+    }
+
+    try output_file.writeStreamingAll(io, "size += field.len;");
+    try output_file.writeStreamingAll(io, "try writer.writeAll(field);}");
+
+    if (is_nullable) {
+        try output_file.writeStreamingAll(io, "else {");
+
+        if (is_flexible) {
+            try output_file.writeStreamingAll(io, "size += try writeUnsignedVarInt(writer, 0);");
+        } else {
+            // Legacy needs to differentiate between string vs bytes/records
+            if (std.mem.eql(u8, field.type, "string")) {
+                try output_file.writeStreamingAll(io, "size += 2");
+                try output_file.writeStreamingAll(io, "try writer.writeInt(i16, -1, .big);");
+            } else {
+                try output_file.writeStreamingAll(io, "size += 4");
+                // "bytes" and "records"
+                try output_file.writeStreamingAll(io, "try writer.writeInt(i32, -1, .big);");
+            }
+        }
+
+        try output_file.writeStreamingAll(io, "}");
+    }
 }
 
 fn mapSubtype(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usize, output_file: Io.File) !void {
@@ -308,11 +536,35 @@ fn mapField(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usi
     const field_versions = try VersionRange.parse(field.versions);
     if (!field_versions.contains(version)) return;
 
-    const snake_name = try toSnakeCase(arena, field.name);
+    const nullable_versions = if (field.nullableVersions) |v| try VersionRange.parse(v) else VersionRange.none;
+
+    const snake_name = field.snake_name;
     const zig_type = mapKafkaType(field.type);
 
+    const nullable = if (nullable_versions.contains(version)) "?" else "";
+
+    var default_buffer: [128]u8 = undefined;
+
+    const default = if (field.default) |value|
+        switch (value) {
+            .null => " = null",
+            .string => |s| blk: {
+                if (std.mem.eql(u8, "null", s)) {
+                    break :blk " = null";
+                }
+                break :blk try std.fmt.bufPrint(&default_buffer, " = {s}", .{s});
+            },
+            .integer => |i| try std.fmt.bufPrint(&default_buffer, " = {}", .{i}),
+            else => {
+                std.log.err("Bad default {any}", .{value});
+                return error.UnsupportedType;
+            },
+        }
+    else
+        "";
+
     // A quick allocPrint makes this way cleaner than manual writeStreamingAll
-    const field_str = try std.fmt.allocPrint(arena, "{s}: {s},", .{ snake_name, zig_type });
+    const field_str = try std.fmt.allocPrint(arena, "{s}: {s}{s}{s},", .{ snake_name, nullable, zig_type, default });
     try output_file.writeStreamingAll(io, field_str);
 }
 
@@ -321,4 +573,4 @@ fn fatal(comptime format: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-pub const std_options: std.Options = .{ .log_level = .debug };
+pub const std_options: std.Options = .{ .log_level = .err };

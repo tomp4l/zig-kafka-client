@@ -28,9 +28,17 @@ pub fn main(init: std.process.Init) !void {
         0x00, 0x00, 0x00, 0x01, // Correlation ID: 1
         0xff, 0xff, // Client ID: null (-1)
     };
-
     try writer.interface.writeAll(&payload);
+
+    // const request: protocol.ApiVersionsRequestV0 = .{};
+    // const arena = init.arena.allocator();
+    // const payload = try request.serialise(arena);
+    // try writer.interface.writeAll(payload);
     try writer.interface.flush();
     _ = try reader.interface.stream(&stdout_writer.interface, .unlimited);
     try stdout_writer.interface.flush();
+}
+
+test {
+    _ = @import("protocol_tests.zig");
 }
