@@ -29,12 +29,12 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator) !void {
 }
 
 pub fn close(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+    if (self.read_future) |*f| f.cancel(io);
+
     self.inflight_requests_mutex.lock(io) catch {
         return;
     };
     defer self.inflight_requests_mutex.unlock(io);
-
-    if (self.read_future) |*f| f.cancel(io);
 
     self.inflight_requests.deinit(allocator);
 }
@@ -48,6 +48,7 @@ const InFlightRequest = struct {
 const RequestState = enum(u32) {
     started,
     completed,
+    errored,
 };
 
 pub fn KafkaResponse(comptime T: type) type {
@@ -103,9 +104,14 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
     }
 
     // this can have timeout but worry later
-    try io.futexWait(RequestState, &in_flight.request_state.raw, .started);
+    while (in_flight.request_state.load(.acquire) == .started)
+        try io.futexWait(RequestState, &in_flight.request_state.raw, .started);
     const new_state = in_flight.request_state.load(.acquire);
-    _ = new_state;
+    switch (new_state) {
+        .started => unreachable,
+        .completed => {},
+        .errored => return error.ConnectionClosed,
+    }
 
     return .{
         .allocator = allocator,
@@ -114,24 +120,47 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
     };
 }
 
-fn recordReadError(self: *Self, err: anyerror) void {
+fn recordReadError(self: *Self, io: Io, err: anyerror, curr_request: ?*InFlightRequest) void {
     switch (err) {
         error.EndOfStream => {},
         else => std.log.warn("got read error: {}", .{err}),
     }
     self.read_error = err;
+
+    if (curr_request) |request| {
+        request.request_state.store(.errored, .release);
+
+        io.futexWake(RequestState, &request.request_state.raw, 1);
+    }
+
+    self.inflight_requests_mutex.lock(io) catch {
+        if (self.inflight_requests.count() == 0) return;
+
+        std.log.err("cancellation with in flight requests", .{});
+        return;
+    };
+    defer self.inflight_requests_mutex.unlock(io);
+
+    var it = self.inflight_requests.valueIterator();
+    while (it.next()) |request| {
+        request.*.request_state.store(.errored, .release);
+
+        io.futexWake(RequestState, &request.*.request_state.raw, 1);
+    }
+
+    self.inflight_requests.clearRetainingCapacity();
 }
 
 fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     while (true) {
 
         // read next message
-        var size = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(err);
-        const correlation_id = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(err);
+        var size = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(io, err, null);
+        const correlation_id = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(io, err, null);
         size -= 4;
 
         const request = lock: {
-            self.inflight_requests_mutex.lock(io) catch |err| return self.recordReadError(err);
+            self.inflight_requests_mutex.lock(io) catch |err| return self.recordReadError(io, err, null);
             defer self.inflight_requests_mutex.unlock(io);
             break :lock self.inflight_requests.fetchRemove(correlation_id);
         };
@@ -140,20 +169,23 @@ fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
             const r = kv.value;
 
             if (r.is_flexible) {
-                const flexible = self.reader.takeByte() catch |err| return self.recordReadError(err);
-                if (flexible != 0) return self.recordReadError(error.Unimplemented);
+                const flexible = self.reader.takeByte() catch |err| return self.recordReadError(io, err, r);
+                if (flexible != 0) return self.recordReadError(io, error.Unimplemented, r);
                 size -= 1;
             }
 
-            const response_body = allocator.alloc(u8, size) catch |err| return self.recordReadError(err);
+            const response_body = allocator.alloc(u8, size) catch |err| return self.recordReadError(io, err, r);
+            var finished = false;
+            defer if (!finished) allocator.free(response_body);
 
-            self.reader.readSliceAll(response_body) catch |err| return self.recordReadError(err);
+            self.reader.readSliceAll(response_body) catch |err| return self.recordReadError(io, err, r);
 
             r.response = response_body;
             r.request_state.store(.completed, .release);
             io.futexWake(RequestState, &r.request_state.raw, 1);
+            finished = true;
         } else {
-            self.reader.discardAll(size) catch |err| return self.recordReadError(err);
+            self.reader.discardAll(size) catch |err| return self.recordReadError(io, err, null);
         }
     }
 }
@@ -175,8 +207,8 @@ test "fake request / response" {
     defer output_pipe.close();
 
     const FakeRequest = struct {
-        pub const version = 1;
-        pub const api_key = 1;
+        pub const version = 2;
+        pub const api_key = 0x69;
         pub const is_flexible = false;
 
         pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
@@ -204,7 +236,7 @@ test "fake request / response" {
 
     const fake_request: FakeRequest = .{};
 
-    const RequestError = error{ WriteFailed, Canceled, OutOfMemory, UnexpectedInput };
+    const RequestError = anyerror;
     const Wrapper = struct {
         fn makeRequest(c: *Self, io_: Io, allocator_: std.mem.Allocator, request: FakeRequest) RequestError!KafkaResponse(FakeResponse) {
             return c.makeRequest(FakeResponse, io_, allocator_, request);
@@ -225,4 +257,74 @@ test "fake request / response" {
     defer response.deinit();
 
     try std.testing.expectEqual(FakeResponse{}, response.value);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x0F, // 15 bytes
+        0x00, 0x69, // api key
+        0x00, 0x02, // version
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0xFF, 0xFF, // null client id
+        'h', 'e', 'l', 'l', 'o', // dummy payload
+    }, try output_pipe.reader.take(19));
+}
+
+test "it propogates errors" {
+    const Pipe = @import("testing/Pipe.zig");
+    const io = std.testing.io;
+
+    var input_buffers: Pipe.DefaultPipeBuffers = .init;
+    var input_pipe: Pipe = .initWithBuffers(io, &input_buffers);
+    defer input_pipe.close();
+
+    var output_buffers: Pipe.DefaultPipeBuffers = .init;
+    var output_pipe: Pipe = .initWithBuffers(io, &output_buffers);
+    defer output_pipe.close();
+
+    const FakeRequest = struct {
+        pub const version = 1;
+        pub const api_key = 1;
+        pub const is_flexible = false;
+
+        pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
+            _ = self;
+            _ = writer;
+        }
+    };
+
+    const FakeResponse = struct {
+        pub fn deserialise(bytes: []const u8) !@This() {
+            _ = bytes;
+            return .{};
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
+    defer client.close(io, allocator);
+
+    try client.connect(io, allocator);
+
+    const fake_request: FakeRequest = .{};
+
+    const RequestError = anyerror;
+    const Wrapper = struct {
+        fn makeRequest(c: *Self, io_: Io, allocator_: std.mem.Allocator, request: FakeRequest) RequestError!KafkaResponse(FakeResponse) {
+            return c.makeRequest(FakeResponse, io_, allocator_, request);
+        }
+    };
+
+    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &client, io, allocator, fake_request });
+
+    _ = try output_pipe.reader.peek(1);
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 0x0a, // 10 bytes
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, // incomplete body
+    });
+
+    input_pipe.close();
+
+    try std.testing.expectError(error.ConnectionClosed, future_response.await(io));
 }
