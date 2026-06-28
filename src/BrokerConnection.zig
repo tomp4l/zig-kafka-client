@@ -63,6 +63,14 @@ pub fn KafkaResponse(comptime T: type) type {
     };
 }
 
+fn cleanOutstandingRequest(self: *Self, io: Io, correlation_id: u32) void {
+    self.inflight_requests_mutex.lock(io) catch {
+        return;
+    };
+    _ = self.inflight_requests.remove(correlation_id);
+    self.inflight_requests_mutex.unlock(io);
+}
+
 fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !KafkaResponse(ResponseType) {
     const RequestType = @TypeOf(request);
     var in_flight: InFlightRequest = .{ .is_flexible = RequestType.is_flexible };
@@ -73,11 +81,7 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
         try self.inflight_requests.put(allocator, correlation_id, &in_flight);
     }
     // Ensure we always clean up if something goes wrong
-    defer {
-        self.inflight_requests_mutex.lock(io) catch {};
-        _ = self.inflight_requests.remove(correlation_id);
-        self.inflight_requests_mutex.unlock(io);
-    }
+    defer cleanOutstandingRequest(self, io, correlation_id);
 
     var discarding: Io.Writer.Discarding = .init(&.{});
     try request.serialise(&discarding.writer);
