@@ -42,7 +42,7 @@ pub fn close(self: *Self, io: Io, allocator: std.mem.Allocator) void {
 const InFlightRequest = struct {
     request_state: std.atomic.Value(RequestState) = .init(.started),
     response: []const u8 = undefined,
-    is_flexible: bool,
+    response_header_flexible: bool,
 };
 
 const RequestState = enum(u32) {
@@ -71,9 +71,12 @@ fn cleanOutstandingRequest(self: *Self, io: Io, correlation_id: u32) void {
     self.inflight_requests_mutex.unlock(io);
 }
 
-fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !KafkaResponse(ResponseType) {
+// why is this special :(
+const API_VERSION_KEY = 18;
+
+pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !KafkaResponse(ResponseType) {
     const RequestType = @TypeOf(request);
-    var in_flight: InFlightRequest = .{ .is_flexible = RequestType.is_flexible };
+    var in_flight: InFlightRequest = .{ .response_header_flexible = RequestType.is_flexible and RequestType.api_key != API_VERSION_KEY };
     const correlation_id = self.getNextCorrelationId();
     {
         try self.inflight_requests_mutex.lock(io);
@@ -120,13 +123,13 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
     return .{
         .allocator = allocator,
         .raw_buffer = in_flight.response,
-        .value = try ResponseType.deserialise(in_flight.response),
+        .value = try ResponseType.deserialise(allocator, in_flight.response),
     };
 }
 
 fn recordReadError(self: *Self, io: Io, err: anyerror, curr_request: ?*InFlightRequest) void {
     switch (err) {
-        error.EndOfStream => {},
+        error.EndOfStream, error.ReadFailed, error.Cancelled => {},
         else => std.log.warn("got read error: {}", .{err}),
     }
     self.read_error = err;
@@ -172,7 +175,7 @@ fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
         if (request) |kv| {
             const r = kv.value;
 
-            if (r.is_flexible) {
+            if (r.response_header_flexible) {
                 const flexible = self.reader.takeByte() catch |err| return self.recordReadError(io, err, r);
                 if (flexible != 0) return self.recordReadError(io, error.Unimplemented, r);
                 size -= 1;
@@ -222,7 +225,7 @@ test "fake request / response" {
     };
 
     const FakeResponse = struct {
-        pub fn deserialise(bytes: []const u8) !@This() {
+        pub fn deserialise(_: std.mem.Allocator, bytes: []const u8) !@This() {
             if (bytes.len == 6) {
                 return .{};
             } else {
@@ -296,7 +299,7 @@ test "it propogates errors" {
     };
 
     const FakeResponse = struct {
-        pub fn deserialise(bytes: []const u8) !@This() {
+        pub fn deserialise(_: std.mem.Allocator, bytes: []const u8) !@This() {
             _ = bytes;
             return .{};
         }

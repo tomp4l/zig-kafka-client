@@ -8,35 +8,33 @@ const protocol = @import("protocol");
 pub fn main(init: std.process.Init) !void {
     const host_name = try Io.net.HostName.init("localhost");
 
+    const arena = init.arena.allocator();
+    const io = init.io;
+
     const socket = try host_name.connect(init.io, 9092, .{ .mode = .stream });
     defer socket.close(init.io);
 
     var read_buf: [4096]u8 = undefined;
     var write_buf: [4096]u8 = undefined;
-    var stdout_buf: [4096]u8 = undefined;
 
     var reader = socket.reader(init.io, &read_buf);
     var writer = socket.writer(init.io, &write_buf);
 
-    const stdout = Io.File.stdout();
-    var stdout_writer = stdout.writer(init.io, &stdout_buf);
+    var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
 
-    const payload = [_]u8{
-        0x00, 0x00, 0x00, 0x0a, // Size: 10
-        0x00, 0x12, // API Key: 18
-        0x00, 0x00, // API Version: 0
-        0x00, 0x00, 0x00, 0x01, // Correlation ID: 1
-        0xff, 0xff, // Client ID: null (-1)
+    try connection.connect(io, arena);
+    defer connection.close(io, arena);
+
+    const req = protocol.ApiVersionsRequestV3{
+        .client_software_name = "test",
+        .client_software_version = "0.0.0",
     };
-    try writer.interface.writeAll(&payload);
 
-    // const request: protocol.ApiVersionsRequestV0 = .{};
-    // const arena = init.arena.allocator();
-    // const payload = try request.serialise(arena);
-    // try writer.interface.writeAll(payload);
-    try writer.interface.flush();
-    _ = try reader.interface.stream(&stdout_writer.interface, .unlimited);
-    try stdout_writer.interface.flush();
+    const response = try connection.makeRequest(protocol.ApiVersionsResponseV3, io, arena, req);
+
+    for (response.value.api_keys) |k| {
+        std.debug.print("Key {}: {}-{}\n", .{ k.api_key, k.min_version, k.max_version });
+    }
 }
 
 test {
