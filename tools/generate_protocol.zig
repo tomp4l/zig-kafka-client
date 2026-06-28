@@ -15,11 +15,16 @@ pub fn main(init: std.process.Init) !void {
         fatal("unable to open '{s}': {s}", .{ output_file_path, @errorName(err) });
     };
 
+    var buffer: [1024]u8 = undefined;
+    var file_writer = output_file.writer(io, &buffer);
+    const writer = &file_writer.interface;
     std.log.debug("protocol out file: {s}", .{output_file_path});
 
-    generateAllStructs(io, arena, output_file) catch |err| {
+    generateAllStructs(io, arena, writer) catch |err| {
         fatal("unable to generate files '{s}': {s}", .{ output_file_path, @errorName(err) });
     };
+
+    try writer.flush();
 
     output_file.close(io);
 
@@ -157,10 +162,10 @@ const ProtocolJson = struct {
     }
 };
 
-fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !void {
-    try output_file.writeStreamingAll(io, "const std = @import(\"std\");");
+fn generateAllStructs(io: Io, arena: std.mem.Allocator, writer: *Io.Writer) !void {
+    try writer.writeAll("const std = @import(\"std\");");
 
-    try output_file.writeStreamingAll(io,
+    try writer.writeAll(
         \\ fn writeUnsignedVarInt(writer: *std.Io.Writer, value: usize) !void {
         \\     var temp = value;
         \\     while (true) {
@@ -175,7 +180,29 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !v
         \\             break;
         \\         }
         \\     }
-        \\ } 
+        \\ }
+        \\
+        \\ fn readUnsignedVarInt(bytes: []const u8) !struct { value: usize, bytes_read: usize } {
+        \\   var value: usize = 0;
+        \\   var shift: u6 = 0;
+        \\   var bytes_read: usize = 0;
+        \\   
+        \\   while (bytes_read < bytes.len) {
+        \\       const byte = bytes[bytes_read];
+        \\       bytes_read += 1;
+        \\
+        \\       value |= @as(usize, byte & 0x7F) << shift;
+        \\   
+        \\       if ((byte & 0x80) == 0) {
+        \\           return .{ .value = value, .bytes_read = bytes_read };
+        \\       }
+        \\   
+        \\       if (shift >= 63) return error.VarIntTooBig;
+        \\           shift += 7;
+        \\       }
+        \\   
+        \\       return error.TooShort;
+        \\   }
     );
 
     var inputs = try Io.Dir.cwd().openDir(io, "protocol", .{ .iterate = true });
@@ -237,14 +264,14 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, output_file: Io.File) !v
 
         try json.populateGeneratedFields(arena);
 
-        try generateStructVersions(io, arena, json, output_file);
+        try generateStructVersions(io, arena, json, writer);
     }
 }
 
-fn generateStructVersions(io: Io, arena: std.mem.Allocator, protocol_json: ProtocolJson, output_file: Io.File) !void {
+fn generateStructVersions(io: Io, arena: std.mem.Allocator, protocol_json: ProtocolJson, writer: *Io.Writer) !void {
     var version_it = try protocol_json.validVersionsIterator();
     while (version_it.next()) |version| {
-        try generateStructVersion(io, arena, protocol_json, version, output_file);
+        try generateStructVersion(io, arena, protocol_json, version, writer);
     }
 }
 
@@ -283,7 +310,7 @@ fn generateStructVersion(
     arena: std.mem.Allocator,
     protocol_json: ProtocolJson,
     version: usize,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
 
     // shared buffer for all formatting
@@ -296,112 +323,342 @@ fn generateStructVersion(
     const is_flexible = flexible_versions.contains(version);
     const is_request = std.mem.eql(u8, "request", protocol_json.type);
 
-    try output_file.writeStreamingAll(io, "pub const ");
-    try output_file.writeStreamingAll(io, name);
-    try output_file.writeStreamingAll(io, "= struct {");
-
-    try output_file.writeStreamingAll(io, "pub const api_key = ");
-    const api_key_length = std.fmt.printInt(&print_buffer, protocol_json.apiKey, 10, .lower, .{});
-    try output_file.writeStreamingAll(io, print_buffer[0..api_key_length]);
-
-    try output_file.writeStreamingAll(io, ";");
-
-    try output_file.writeStreamingAll(io, "pub const is_request = ");
-    try output_file.writeStreamingAll(io, if (is_request) "true;" else "false;");
-
-    try output_file.writeStreamingAll(io, "pub const is_flexible = ");
-    try output_file.writeStreamingAll(io, if (is_flexible) "true;" else "false;");
-
-    try output_file.writeStreamingAll(io, "pub const version = ");
-    const version_length = std.fmt.printInt(&print_buffer, version, 10, .lower, .{});
-    try output_file.writeStreamingAll(io, print_buffer[0..version_length]);
-
-    try output_file.writeStreamingAll(io, ";");
+    try writer.print(
+        \\ pub const {s} = struct {{
+        \\   pub const api_key = {};
+        \\   pub const is_request = {};
+        \\   pub const is_flexible = {};
+        \\   pub const version = {};
+    , .{
+        name,
+        protocol_json.apiKey,
+        is_request,
+        is_flexible,
+        version,
+    });
 
     for (protocol_json.fields) |field| {
-        try mapSubtype(io, arena, field, version, output_file);
+        try mapSubtype(io, arena, field, version, is_request, is_flexible, writer);
     }
 
     for (protocol_json.fields) |field| {
-        try mapField(io, arena, field, version, output_file);
+        try mapField(field, version, writer);
     }
 
     if (is_request) {
-        try createSerialise(io, arena, protocol_json, version, is_flexible, output_file);
+        try createSerialise(arena, protocol_json, version, is_flexible, writer);
     } else {
-        // try createDeserialise(io, arena, protocol_json, version, is_flexible, output_file);
+        try createDeserialise(protocol_json, version, is_flexible, writer);
     }
 
-    try output_file.writeStreamingAll(io, "};");
+    try writer.writeAll("};");
 }
 
 fn createDeserialise(
-    io: Io,
-    arena: std.mem.Allocator,
     protocol_json: ProtocolJson,
     version: usize,
     is_flexible: bool,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
-    try output_file.writeStreamingAll(io,
-        \\ pub fn deserialise(self: *const @This(), allocator: std.mem.Allocator, bytes: [] const u8) !void {
-        \\
+    try writer.writeAll(
+        \\ pub fn deserialise(allocator: std.mem.Allocator, bytes: [] const u8) !@This() {
+        \\   var current_offset: usize = 0;
+        \\   var self: @This() = .{
     );
 
     for (protocol_json.fields) |field| {
         const field_versions = try VersionRange.parse(field.versions);
         if (field_versions.contains(version)) {
-            _ = is_flexible;
-            _ = arena;
-            // try createDeserialiseField(io, arena, field, version, is_flexible, output_file);
+            try createFieldInitialisation(field, writer);
         }
     }
 
-    try output_file.writeStreamingAll(io,
+    try writer.writeAll("};");
+
+    try createSerialiseFields(protocol_json.fields, version, is_flexible, writer);
+
+    try writer.writeAll(
+        \\ return self;
+        \\ }
+    );
+}
+
+fn getImplicitDefault(field: ProtocolField, version: usize) ![]const u8 {
+    if (field.nullableVersions) |nv| {
+        if ((try VersionRange.parse(nv)).contains(version)) {
+            return "null";
+        }
+    }
+    if (std.mem.eql(u8, field.type, "bool")) return "false";
+    if (std.mem.startsWith(u8, field.type, "int")) return "0";
+    if (std.mem.eql(u8, field.type, "float64")) return "0.0";
+    if (std.mem.eql(u8, field.type, "uuid")) return "@splat(0)";
+
+    // Strings, bytes, records, and arrays defaults to empty slices
+    return "&.{}";
+}
+
+fn createDefaultInit(field: ProtocolField, version: usize, writer: *Io.Writer) !void {
+    const has_default = field.default != null;
+    if (has_default) return;
+
+    try writer.print(
+        \\ self.{s} = {s};
+    , .{ field.snake_name, try getImplicitDefault(field, version) });
+}
+
+fn createSerialiseFields(
+    fields: []const ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    writer: *Io.Writer,
+) !void {
+    var allocated = false;
+    for (fields) |field| {
+        const field_versions = try VersionRange.parse(field.versions);
+        if (field_versions.contains(version)) {
+            const is_tagged = if (field.taggedVersions) |v| (try VersionRange.parse(v)).contains(version) else false;
+            if (is_tagged) {
+                try createDefaultInit(field, version, writer);
+            } else {
+                allocated = try createDeserialiseField(field, version, is_flexible, writer) or allocated;
+            }
+        }
+    }
+
+    if (is_flexible) {
+        try writer.writeAll(
+            \\ const var_int_tags = try readUnsignedVarInt(bytes[current_offset..]);
+            \\ current_offset += var_int_tags.bytes_read;
+            \\ var number_tags = var_int_tags.value;
+            \\ while(true) {
+            \\   if (number_tags == 0) break;
+            \\   number_tags -= 1;
+            \\   const current_tag = try readUnsignedVarInt(bytes[current_offset..]);
+            \\   current_offset += current_tag.bytes_read;
+            \\   const current_size = try readUnsignedVarInt(bytes[current_offset..]);
+            \\   current_offset += current_size.bytes_read;
+            \\   switch(current_tag.value) {
+        );
+    }
+
+    for (fields) |field| {
+        const field_versions = try VersionRange.parse(field.versions);
+        if (field_versions.contains(version)) {
+            const is_tagged = if (field.taggedVersions) |v| (try VersionRange.parse(v)).contains(version) else false;
+            if (!is_tagged) continue;
+            const tag = field.tag orelse return error.ExpectingTag;
+
+            try writer.print("{} => ", .{tag});
+            allocated = try createDeserialiseField(field, version, is_flexible, writer) or allocated;
+            try writer.writeAll(",");
+        }
+    }
+
+    if (is_flexible) {
+        try writer.writeAll(
+            \\      else => {
+            \\        current_offset += current_size.value;
+            \\      },
+            \\    }
+            \\  }
+        );
+    }
+
+    if (!allocated) {
+        try writer.writeAll("_=allocator;");
+    }
+}
+
+fn createDeserialiseSubType(
+    protocol_field: ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    writer: *Io.Writer,
+) !void {
+    try writer.writeAll(
+        \\ pub fn deserialise(self: *@This(), allocator: std.mem.Allocator, bytes: [] const u8) !usize {
+        \\   var current_offset: usize = 0;
+    );
+    try createSerialiseFields(protocol_field.fields, version, is_flexible, writer);
+
+    try writer.writeAll(
+        \\   return current_offset; 
         \\ }
         \\
     );
 }
 
+fn createFieldInitialisation(
+    field: ProtocolField,
+    writer: *Io.Writer,
+) !void {
+    if (field.default == null) {
+        try writer.print(".{s} = undefined,", .{field.snake_name});
+    }
+}
+
 fn createDeserialiseField(
-    io: Io,
-    arena: std.mem.Allocator,
     field: ProtocolField,
     version: usize,
     is_flexible: bool,
-    output_file: Io.File,
-) !void {
-    _ = arena;
-    _ = io;
-    _ = version;
-    _ = is_flexible;
-    _ = output_file;
-
+    writer: *Io.Writer,
+) !bool {
     const kafka_type = field.type;
-    if (std.mem.eql(u8, kafka_type, "int8")) @panic("int");
-    if (std.mem.eql(u8, kafka_type, "int16")) @panic("int");
-    if (std.mem.eql(u8, kafka_type, "int32")) @panic("int");
-    if (std.mem.eql(u8, kafka_type, "int64")) @panic("int");
-    if (std.mem.eql(u8, kafka_type, "bool")) @panic("bool");
-    if (std.mem.eql(u8, kafka_type, "string")) @panic("string");
-    if (std.mem.eql(u8, kafka_type, "bytes")) @panic("bytes");
-    if (std.mem.eql(u8, kafka_type, "records")) @panic("records");
+    if (std.mem.eql(u8, kafka_type, "int8")) return createDeserialiseInt(i8, field, writer);
+    if (std.mem.eql(u8, kafka_type, "int16")) return createDeserialiseInt(i16, field, writer);
+    if (std.mem.eql(u8, kafka_type, "int32")) return createDeserialiseInt(i32, field, writer);
+    if (std.mem.eql(u8, kafka_type, "int64")) return createDeserialiseInt(i64, field, writer);
+    if (std.mem.eql(u8, kafka_type, "bool")) return createDeserialiseBool(field, writer);
+    if (std.mem.eql(u8, kafka_type, "string")) return createDeserialiseBytes(field, version, is_flexible, writer);
+    if (std.mem.eql(u8, kafka_type, "bytes")) return createDeserialiseBytes(field, version, is_flexible, writer);
+    if (std.mem.eql(u8, kafka_type, "records")) return createDeserialiseBytes(field, version, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "uuid")) @panic("uuid");
     if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
 
     // Fallback for custom nested arrays (e.g. "[]Topic")
-    @panic(kafka_type);
+    try createDeserialiseArray(field, is_flexible, writer);
+    return true;
+}
+
+fn createDeserialiseArray(
+    field: ProtocolField,
+    is_flexible: bool,
+    writer: *Io.Writer,
+) !void {
+    if (!std.mem.eql(u8, "[]", field.type[0..2])) return error.ExpectingArray;
+    const type_name = field.type[2..];
+
+    try writer.writeAll("{");
+    if (is_flexible) {
+        try writer.writeAll(
+            \\ const var_int = try readUnsignedVarInt(bytes[current_offset..]);
+            \\ current_offset += var_int.bytes_read;
+            \\ const is_null = var_int.value == 0;
+            \\ const length = var_int.value -| 1;
+        );
+    } else {
+        try writer.writeAll(
+            \\    const int_size = 4;
+            \\    if (current_offset + int_size > bytes.len) return error.TooShort;
+            \\    const length = std.mem.readInt(i32, bytes[current_offset .. current_offset + int_size][0..int_size], .big);
+            \\    const is_null = length == -1;
+            \\    current_offset += int_size;
+        );
+    }
+
+    // allocate
+    try writer.print(
+        \\ if (is_null) {{
+        \\     const FieldType = @TypeOf(self.{s});
+        \\     const type_info = @typeInfo(FieldType);
+        \\     switch (type_info) {{
+        \\       .optional => self.{s} = null,
+        \\       else => return error.NonNullableField,
+        \\     }}
+        \\ }} else {{
+        \\     const values = try allocator.alloc({s}, @intCast(length));
+        \\     errdefer allocator.free(values);
+        \\     self.{s} = values;
+        \\     for (values) |*value| {{
+        \\         current_offset += try value.deserialise(allocator, bytes[current_offset..]);
+        \\     }}
+        \\ }}
+    , .{ field.snake_name, field.snake_name, type_name, field.snake_name });
+
+    try writer.writeAll("}");
+}
+
+fn createDeserialiseBytes(
+    field: ProtocolField,
+    version: usize,
+    is_flexible: bool,
+    writer: *Io.Writer,
+) !bool {
+    _ = version;
+    try writer.writeAll("{");
+    if (is_flexible) {
+        try writer.writeAll(
+            \\ const var_int = try readUnsignedVarInt(bytes[current_offset..]);
+            \\ current_offset += var_int.bytes_read;
+            \\ const is_null = var_int.value == 0;
+            \\ const length = var_int.value -| 1;
+        );
+    } else {
+        const int_type = if (std.mem.eql(u8, field.type, "string")) "i16" else "i32";
+        const int_type_size: usize = if (std.mem.eql(u8, field.type, "string")) 2 else 4;
+
+        try writer.print(
+            \\    const int_size = {};
+            \\    if (current_offset + int_size > bytes.len) return error.TooShort;
+            \\    const length = std.mem.readInt({s}, bytes[current_offset .. current_offset + int_size][0..int_size], .big);
+            \\    const is_null = length == -1;
+            \\    current_offset += int_size;
+        , .{ int_type_size, int_type });
+    }
+
+    try writer.print(
+        \\if (!is_null) {{
+        \\   if (current_offset + length > bytes.len) return error.TooShort;
+        \\   self.{s} = bytes[current_offset..current_offset+length];
+        \\   current_offset+=length;
+        \\}} else {{
+        \\   const FieldType = @TypeOf(self.{s});
+        \\   const type_info = @typeInfo(FieldType);
+        \\   switch (type_info) {{
+        \\     .optional => self.{s} = null,
+        \\     else => return error.NonNullableField,
+        \\   }}
+        \\}}
+    , .{ field.snake_name, field.snake_name, field.snake_name });
+
+    try writer.writeAll("}");
+
+    return false;
+}
+
+fn createDeserialiseInt(
+    T: type,
+    field: ProtocolField,
+    writer: *Io.Writer,
+) !bool {
+    try writer.print(
+        \\{{
+        \\    const size = {};
+        \\    if (current_offset + size > bytes.len) return error.TooShort;
+        \\    self.{s} = std.mem.readInt({}, bytes[current_offset .. current_offset + size][0..size], .big);
+        \\    current_offset += size;
+        \\}}
+    , .{ @sizeOf(T), field.snake_name, T });
+
+    return false;
+}
+
+fn createDeserialiseBool(
+    field: ProtocolField,
+    writer: *Io.Writer,
+) !bool {
+    try writer.print(
+        \\{{
+        \\    if (current_offset + 1 > bytes.len) {{
+        \\       return error.TooShort;
+        \\    }}
+        \\    self.{s} = bytes[current_offset] != 0;
+        \\    current_offset += 1;
+        \\}}
+    , .{field.snake_name});
+
+    return false;
 }
 
 fn createSerialise(
-    io: Io,
     arena: std.mem.Allocator,
     protocol_json: ProtocolJson,
     version: usize,
     is_flexible: bool,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
-    try output_file.writeStreamingAll(io,
+    try writer.writeAll(
         \\ pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
         \\
     );
@@ -410,53 +667,52 @@ fn createSerialise(
         const field_versions = try VersionRange.parse(field.versions);
         if (field_versions.contains(version)) {
             has_field = true;
-            try createSerialiseField(io, arena, field, version, is_flexible, output_file);
+            try createSerialiseField(arena, field, version, is_flexible, writer);
         }
     }
 
     if (!has_field) {
-        try output_file.writeStreamingAll(io,
+        try writer.writeAll(
             \\   _ = self;
         );
     }
 
     if (is_flexible) {
         // todo proper flexible handling
-        try output_file.writeStreamingAll(io, "try writer.writeByte(0x00);");
+        try writer.writeAll("try writer.writeByte(0x00);");
     }
 
-    try output_file.writeStreamingAll(io,
+    try writer.writeAll(
         \\   try writer.flush();
         \\ }
     );
 }
 
 fn createSerialiseField(
-    io: Io,
     arena: std.mem.Allocator,
     field: ProtocolField,
     version: usize,
     is_flexible: bool,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
     _ = arena;
 
     const kafka_type = field.type;
     if (std.mem.eql(u8, kafka_type, "int8"))
-        return createSerialiseInt(i8, io, field, output_file);
+        return createSerialiseInt(i8, field, writer);
     if (std.mem.eql(u8, kafka_type, "int16"))
-        return createSerialiseInt(i16, io, field, output_file);
+        return createSerialiseInt(i16, field, writer);
     if (std.mem.eql(u8, kafka_type, "int32"))
-        return createSerialiseInt(i32, io, field, output_file);
+        return createSerialiseInt(i32, field, writer);
     if (std.mem.eql(u8, kafka_type, "int64"))
-        return createSerialiseInt(i64, io, field, output_file);
+        return createSerialiseInt(i64, field, writer);
     if (std.mem.eql(u8, kafka_type, "bool")) @panic("bool");
     if (std.mem.eql(u8, kafka_type, "string"))
-        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+        return createSerialiseBytes(field, version, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "bytes"))
-        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+        return createSerialiseBytes(field, version, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "records"))
-        return createSerialiseBytes(io, field, version, is_flexible, output_file);
+        return createSerialiseBytes(field, version, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "uuid")) @panic("uuid");
     if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
 
@@ -466,49 +722,23 @@ fn createSerialiseField(
 
 fn createSerialiseInt(
     T: type,
-    io: Io,
     field: ProtocolField,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
-    try output_file.writeStreamingAll(io,
-        \\ {
-        \\   var buf: [
-    );
-    const size = switch (@sizeOf(T)) {
-        1 => "1",
-        2 => "2",
-        4 => "4",
-        8 => "8",
-        else => @compileError(std.fmt.comptimePrint("Unsupported size: {}", .{@sizeOf(T)})),
-    };
-    try output_file.writeStreamingAll(io, size);
-    try output_file.writeStreamingAll(io,
-        \\]u8 = undefined;
-        \\  std.mem.writeInt(
-    );
-
-    var type_buffer: [3]u8 = undefined;
-    const type_name = try std.fmt.bufPrint(&type_buffer, "{}", .{T});
-
-    try output_file.writeStreamingAll(io, type_name);
-
-    try output_file.writeStreamingAll(io, ", &buf, self.");
-
-    try output_file.writeStreamingAll(io, field.snake_name);
-
-    try output_file.writeStreamingAll(io,
-        \\, .big);
+    try writer.print(
+        \\ {{
+        \\   var buf: [{}]u8 = undefined;
+        \\   std.mem.writeInt({}, &buf, self.{s} , .big);
         \\   try writer.writeAll(&buf);
-        \\ }
-    );
+        \\ }}
+    , .{ @sizeOf(T), T, field.snake_name });
 }
 
 fn createSerialiseBytes(
-    io: Io,
     field: ProtocolField,
     version: usize,
     is_flexible: bool,
-    output_file: Io.File,
+    writer: *Io.Writer,
 ) !void {
     const is_nullable = if (field.nullableVersions) |n|
         (try VersionRange.parse(n)).contains(version)
@@ -516,72 +746,73 @@ fn createSerialiseBytes(
         false;
 
     if (is_nullable) {
-        try output_file.writeStreamingAll(io, "if(self.");
+        try writer.print("if(self.{s}) |field| {{", .{field.snake_name});
     } else {
-        try output_file.writeStreamingAll(io, "{const field = self.");
-    }
-    try output_file.writeStreamingAll(io, field.snake_name);
-    if (is_nullable) {
-        try output_file.writeStreamingAll(io, ") |field| {");
-    } else {
-        try output_file.writeStreamingAll(io, ";");
+        try writer.print(
+            \\{{
+            \\   const field = self.{s};
+        , .{field.snake_name});
     }
 
     if (is_flexible) {
-        try output_file.writeStreamingAll(io, "try writeUnsignedVarInt(writer, field.len + 1);");
+        try writer.writeAll("try writeUnsignedVarInt(writer, field.len + 1);");
     } else {
         // Legacy needs to differentiate between string vs bytes/records
         if (std.mem.eql(u8, field.type, "string")) {
-            try output_file.writeStreamingAll(io, "try writer.writeInt(i16, @intCast(field.len), .big);");
+            try writer.writeAll("try writer.writeInt(i16, @intCast(field.len), .big);");
         } else {
             // "bytes" and "records"
-            try output_file.writeStreamingAll(io, "try writer.writeInt(i32, @intCast(field.len), .big);");
+            try writer.writeAll("try writer.writeInt(i32, @intCast(field.len), .big);");
         }
     }
 
-    try output_file.writeStreamingAll(io, "try writer.writeAll(field);}");
+    try writer.writeAll("try writer.writeAll(field);}");
 
     if (is_nullable) {
-        try output_file.writeStreamingAll(io, "else {");
+        try writer.writeAll("else {");
 
         if (is_flexible) {
-            try output_file.writeStreamingAll(io, "try writeUnsignedVarInt(writer, 0);");
+            try writer.writeAll("try writeUnsignedVarInt(writer, 0);");
         } else {
             // Legacy needs to differentiate between string vs bytes/records
             if (std.mem.eql(u8, field.type, "string")) {
-                try output_file.writeStreamingAll(io, "try writer.writeInt(i16, -1, .big);");
+                try writer.writeAll("try writer.writeInt(i16, -1, .big);");
             } else {
                 // "bytes" and "records"
-                try output_file.writeStreamingAll(io, "try writer.writeInt(i32, -1, .big);");
+                try writer.writeAll("try writer.writeInt(i32, -1, .big);");
             }
         }
 
-        try output_file.writeStreamingAll(io, "}");
+        try writer.writeAll("}");
     }
 }
 
-fn mapSubtype(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usize, output_file: Io.File) !void {
+fn mapSubtype(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usize, is_request: bool, is_flexible: bool, writer: *Io.Writer) !void {
     const field_versions = try VersionRange.parse(field.versions);
     if (!field_versions.contains(version)) return;
 
     if (field.type[0] == '[' and field.type[1] == ']') {
         for (field.fields) |sub_field| {
-            try mapSubtype(io, arena, sub_field, version, output_file);
+            try mapSubtype(io, arena, sub_field, version, is_request, is_flexible, writer);
         }
 
-        try output_file.writeStreamingAll(io, "pub const ");
-        try output_file.writeStreamingAll(io, field.type[2..]);
-        try output_file.writeStreamingAll(io, "= struct {");
+        try writer.print("pub const {s} = struct {{", .{field.type[2..]});
 
         for (field.fields) |sub_field| {
-            try mapField(io, arena, sub_field, version, output_file);
+            try mapField(sub_field, version, writer);
         }
 
-        try output_file.writeStreamingAll(io, "};");
+        if (is_request) {
+            // serialise?
+        } else {
+            try createDeserialiseSubType(field, version, is_flexible, writer);
+        }
+
+        try writer.writeAll("};");
     }
 }
 
-fn mapField(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usize, output_file: Io.File) !void {
+fn mapField(field: ProtocolField, version: usize, writer: *Io.Writer) !void {
     const field_versions = try VersionRange.parse(field.versions);
     if (!field_versions.contains(version)) return;
 
@@ -612,9 +843,7 @@ fn mapField(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: usi
     else
         "";
 
-    // A quick allocPrint makes this way cleaner than manual writeStreamingAll
-    const field_str = try std.fmt.allocPrint(arena, "{s}: {s}{s}{s},", .{ snake_name, nullable, zig_type, default });
-    try output_file.writeStreamingAll(io, field_str);
+    try writer.print("{s}: {s}{s}{s},", .{ snake_name, nullable, zig_type, default });
 }
 
 fn fatal(comptime format: []const u8, args: anytype) noreturn {

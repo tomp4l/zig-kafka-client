@@ -9,8 +9,10 @@ write_mutex: std.Io.Mutex = .init,
 
 inflight_requests: std.AutoHashMapUnmanaged(u32, *InFlightRequest) = .empty,
 correlation_id: std.atomic.Value(u32) = .init(0),
-reader: *Io.Reader,
+read_future: ?Io.Future(void) = null,
+read_error: ?anyerror = null,
 
+reader: *Io.Reader,
 writer: *Io.Writer,
 
 pub fn init(reader: *Io.Reader, writer: *Io.Writer) Self {
@@ -20,7 +22,20 @@ pub fn init(reader: *Io.Reader, writer: *Io.Writer) Self {
     };
 }
 
-pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator) !void {
+    if (self.read_future != null) return error.AlreadyConnected;
+
+    self.read_future = try io.concurrent(readResponses, .{ self, io, allocator });
+}
+
+pub fn close(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+    self.inflight_requests_mutex.lock(io) catch {
+        return;
+    };
+    defer self.inflight_requests_mutex.unlock(io);
+
+    if (self.read_future) |*f| f.cancel(io);
+
     self.inflight_requests.deinit(allocator);
 }
 
@@ -57,7 +72,11 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
         try self.inflight_requests.put(allocator, correlation_id, &in_flight);
     }
     // Ensure we always clean up if something goes wrong
-    defer _ = self.inflight_requests.remove(correlation_id);
+    defer {
+        self.inflight_requests_mutex.lock(io) catch {};
+        _ = self.inflight_requests.remove(correlation_id);
+        self.inflight_requests_mutex.unlock(io);
+    }
 
     var discarding: Io.Writer.Discarding = .init(&.{});
     try request.serialise(&discarding.writer);
@@ -95,16 +114,24 @@ fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Alloc
     };
 }
 
-fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) !noreturn {
+fn recordReadError(self: *Self, err: anyerror) void {
+    switch (err) {
+        error.EndOfStream => {},
+        else => std.log.warn("got read error: {}", .{err}),
+    }
+    self.read_error = err;
+}
+
+fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     while (true) {
 
         // read next message
-        var size = try self.reader.takeInt(u32, .big);
-        const correlation_id = try self.reader.takeInt(u32, .big);
+        var size = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(err);
+        const correlation_id = self.reader.takeInt(u32, .big) catch |err| return self.recordReadError(err);
         size -= 4;
 
         const request = lock: {
-            try self.inflight_requests_mutex.lock(io);
+            self.inflight_requests_mutex.lock(io) catch |err| return self.recordReadError(err);
             defer self.inflight_requests_mutex.unlock(io);
             break :lock self.inflight_requests.fetchRemove(correlation_id);
         };
@@ -113,20 +140,20 @@ fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) !noreturn {
             const r = kv.value;
 
             if (r.is_flexible) {
-                const flexible = try self.reader.takeByte();
-                if (flexible != 0) return error.Unimplemented;
+                const flexible = self.reader.takeByte() catch |err| return self.recordReadError(err);
+                if (flexible != 0) return self.recordReadError(error.Unimplemented);
                 size -= 1;
             }
 
-            const response_body = try allocator.alloc(u8, size);
+            const response_body = allocator.alloc(u8, size) catch |err| return self.recordReadError(err);
 
-            try self.reader.readSliceAll(response_body);
+            self.reader.readSliceAll(response_body) catch |err| return self.recordReadError(err);
 
             r.response = response_body;
             r.request_state.store(.completed, .release);
             io.futexWake(RequestState, &r.request_state.raw, 1);
         } else {
-            try self.reader.discardAll(size);
+            self.reader.discardAll(size) catch |err| return self.recordReadError(err);
         }
     }
 }
@@ -136,18 +163,24 @@ fn getNextCorrelationId(self: *Self) u32 {
 }
 
 test "fake request / response" {
+    const Pipe = @import("testing/Pipe.zig");
     const io = std.testing.io;
+
+    var input_buffers: Pipe.DefaultPipeBuffers = .init;
+    var input_pipe: Pipe = .initWithBuffers(io, &input_buffers);
+    defer input_pipe.close();
+
+    var output_buffers: Pipe.DefaultPipeBuffers = .init;
+    var output_pipe: Pipe = .initWithBuffers(io, &output_buffers);
+    defer output_pipe.close();
 
     const FakeRequest = struct {
         pub const version = 1;
         pub const api_key = 1;
         pub const is_flexible = false;
-        mutex: *Io.Mutex = undefined,
 
         pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
-            if (self.mutex.state.raw != .unlocked) {
-                self.mutex.unlock(std.testing.io);
-            }
+            _ = self;
             try writer.writeAll("hello");
         }
     };
@@ -157,45 +190,39 @@ test "fake request / response" {
             if (bytes.len == 6) {
                 return .{};
             } else {
-                return error.UnexepectedInput;
+                return error.UnexpectedInput;
             }
         }
     };
 
     const allocator = std.testing.allocator;
-    var fixed_reader = std.Io.Reader.fixed(&.{
-        0x00, 0x00, 0x00, 0x0a, // 10 bytes
-        0x00, 0x00, 0x00, 0x00, // correlation id 0
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 6 junk bytes
-    });
-    var allocating_writer = std.Io.Writer.Allocating.init(allocator);
-    defer allocating_writer.deinit();
 
-    var client: Self = .init(&fixed_reader, &allocating_writer.writer);
-    defer client.deinit(allocator);
+    var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
+    defer client.close(io, allocator);
 
-    var mutex: std.Io.Mutex = .init;
-    try mutex.lock(io);
-    const fake_request: FakeRequest = .{ .mutex = &mutex };
+    try client.connect(io, allocator);
 
+    const fake_request: FakeRequest = .{};
+
+    const RequestError = error{ WriteFailed, Canceled, OutOfMemory, UnexpectedInput };
     const Wrapper = struct {
-        fn makeRequest(c: *Self, io_: Io, allocator_: std.mem.Allocator, request: FakeRequest) !KafkaResponse(FakeResponse) {
+        fn makeRequest(c: *Self, io_: Io, allocator_: std.mem.Allocator, request: FakeRequest) RequestError!KafkaResponse(FakeResponse) {
             return c.makeRequest(FakeResponse, io_, allocator_, request);
         }
     };
 
     var future_response = try io.concurrent(Wrapper.makeRequest, .{ &client, io, allocator, fake_request });
-    try mutex.lock(io);
 
-    var run_response = try io.concurrent(readResponses, .{ &client, io, allocator });
+    _ = try output_pipe.reader.peek(1);
 
-    var result = try future_response.await(io);
-    defer result.deinit();
-    run_response.cancel(io) catch |err| {
-        switch (err) {
-            error.Canceled => return,
-            error.EndOfStream => return,
-            else => return err,
-        }
-    };
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 0x0a, // 10 bytes
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 6 junk bytes
+    });
+
+    var response = try future_response.await(io);
+    defer response.deinit();
+
+    try std.testing.expectEqual(FakeResponse{}, response.value);
 }
