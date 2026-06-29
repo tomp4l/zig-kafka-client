@@ -22,16 +22,17 @@ pub fn main(init: std.process.Init) !void {
 
     var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
 
-    try connection.connect(io, arena);
+    try connection.connect(io, arena, "client_id");
     defer connection.close(io, arena);
 
-    const req = protocol.ApiVersionsRequestV3{
+    const req = protocol.ApiVersionsRequestV5{
         .client_software_name = "test",
         .client_software_version = "0.0.0",
     };
 
-    const response = try connection.makeRequest(protocol.ApiVersionsResponseV3, io, arena, req);
+    const response = try connection.makeRequest(protocol.ApiVersionsResponseV0, io, arena, req);
 
+    std.debug.print("{any}\n", .{response.value.error_code});
     for (response.value.api_keys) |k| {
         std.debug.print("Key {}: {}-{}\n", .{ k.api_key, k.min_version, k.max_version });
     }

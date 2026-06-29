@@ -58,7 +58,7 @@ test "ApiVersionsResponseV0" {
     defer allocator.free(response.api_keys);
 
     // Verify the scalar field
-    try std.testing.expectEqual(@as(i16, 0), response.error_code);
+    try std.testing.expectEqual(protocol.ResponseError.NONE, response.error_code);
 
     // Verify the array allocation and lengths
     const keys = response.api_keys;
@@ -102,7 +102,7 @@ test "ApiVersionsResponseV3" {
     defer allocator.free(response.api_keys);
 
     // Verify the scalar field
-    try std.testing.expectEqual(@as(i16, 0), response.error_code);
+    try std.testing.expectEqual(protocol.ResponseError.NONE, response.error_code);
 
     // Verify the array allocation and lengths
     const keys = response.api_keys;

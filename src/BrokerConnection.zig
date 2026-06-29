@@ -12,6 +12,8 @@ correlation_id: std.atomic.Value(u32) = .init(0),
 read_future: ?Io.Future(void) = null,
 read_error: ?anyerror = null,
 
+client_id: ?[]const u8 = null,
+
 reader: *Io.Reader,
 writer: *Io.Writer,
 
@@ -22,9 +24,10 @@ pub fn init(reader: *Io.Reader, writer: *Io.Writer) Self {
     };
 }
 
-pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator) !void {
+pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]const u8) !void {
     if (self.read_future != null) return error.AlreadyConnected;
 
+    self.client_id = client_id;
     self.read_future = try io.concurrent(readResponses, .{ self, io, allocator });
 }
 
@@ -90,8 +93,13 @@ pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.A
     try request.serialise(&discarding.writer);
     const bytes = discarding.fullCount();
 
-    // would need to consider client ID if not null
-    const size = bytes + if (RequestType.is_flexible) 11 else 10;
+    const client_id_length =
+        if (self.client_id) |client_id|
+            client_id.len
+        else
+            0;
+
+    const size = bytes + client_id_length + if (RequestType.is_flexible) 11 else 10;
 
     {
         try self.write_mutex.lock(io);
@@ -101,8 +109,12 @@ pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.A
         try self.writer.writeInt(u16, RequestType.api_key, .big);
         try self.writer.writeInt(u16, RequestType.version, .big);
         try self.writer.writeInt(u32, correlation_id, .big);
-        //Hard code null client ID for now
-        try self.writer.writeInt(i16, -1, .big);
+        if (self.client_id) |client_id| {
+            try self.writer.writeInt(i16, @intCast(@as(u15, @truncate(client_id.len))), .big);
+            try self.writer.writeAll(client_id);
+        } else {
+            try self.writer.writeInt(i16, -1, .big);
+        }
         if (RequestType.is_flexible) {
             try self.writer.writeByte(0x00);
         }
@@ -239,7 +251,7 @@ test "fake request / response" {
     var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
     defer client.close(io, allocator);
 
-    try client.connect(io, allocator);
+    try client.connect(io, allocator, null);
 
     const fake_request: FakeRequest = .{};
 
@@ -310,7 +322,7 @@ test "it propogates errors" {
     var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
     defer client.close(io, allocator);
 
-    try client.connect(io, allocator);
+    try client.connect(io, allocator, null);
 
     const fake_request: FakeRequest = .{};
 
