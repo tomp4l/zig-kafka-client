@@ -3,7 +3,7 @@ const Io = std.Io;
 
 const kafka_client = @import("kafka_client");
 
-const protocol = @import("protocol");
+const protocol = kafka_client.protocol;
 
 pub fn main(init: std.process.Init) !void {
     const host_name = try Io.net.HostName.init("localhost");
@@ -21,20 +21,50 @@ pub fn main(init: std.process.Init) !void {
     var writer = socket.writer(init.io, &write_buf);
 
     var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
+    defer connection.deinit(io, arena);
 
     try connection.connect(io, arena, "client_id");
-    defer connection.close(io, arena);
 
-    const req = protocol.ApiVersionsRequestV5{
-        .client_software_name = "test",
-        .client_software_version = "0.0.0",
+    try testMetadataRequest(io, arena, &connection);
+}
+
+fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_client.BrokerConnection) !void {
+    var topics: [1]protocol.MetadataRequestV13.MetadataRequestTopic = .{.{
+        .name = "test",
+        .topic_id = @splat(0),
+    }};
+
+    const req = protocol.MetadataRequestV13{
+        .topics = &topics,
+        .include_topic_authorized_operations = false,
     };
 
-    const response = try connection.makeRequest(protocol.ApiVersionsResponseV0, io, arena, req);
+    var response = try connection.makeRequest(protocol.MetadataResponseV13, io, arena, req);
+    defer response.deinit();
 
-    std.debug.print("{any}\n", .{response.value.error_code});
-    for (response.value.api_keys) |k| {
-        std.debug.print("Key {}: {}-{}\n", .{ k.api_key, k.min_version, k.max_version });
+    const value = response.value;
+
+    std.debug.print("cluster id: {?s}, controller id: {}, throttle time: {}\n\n", .{ value.cluster_id, value.controller_id, value.throttle_time_ms });
+
+    for (value.brokers) |broker| {
+        std.debug.print("broker (node_id:{}) (rack:{?s}): {s}:{}\n", .{ broker.node_id, broker.rack, broker.host, broker.port });
+    }
+
+    std.debug.print("\n", .{});
+
+    for (value.topics) |topic| {
+        std.debug.print("Error: {any}, ID: {x} - {?s}\n", .{ topic.error_code, topic.topic_id, topic.name });
+
+        for (topic.partitions) |partition| {
+            std.debug.print("Partition {}: leader: {} in-sync: {any} replicas: {any}\n", .{
+                partition.partition_index,
+                partition.leader_id,
+                partition.isr_nodes,
+                partition.replica_nodes,
+            });
+        }
+
+        std.debug.print("\n", .{});
     }
 }
 

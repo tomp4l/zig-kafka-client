@@ -3,7 +3,7 @@ const Io = std.Io;
 const Writer = Io.Writer;
 const AllocatingWriter = Writer.Allocating;
 
-const protocol = @import("protocol");
+const protocol = @import("kafka_client").protocol;
 
 test {
     std.testing.refAllDecls(protocol);
@@ -115,4 +115,38 @@ test "ApiVersionsResponseV3" {
 
     try std.testing.expectEqual(0, response.finalized_features.len);
     try std.testing.expectEqual(true, response.zk_migration_ready);
+}
+
+test "MetadataRequestV13" {
+    var topics: [1]protocol.MetadataRequestV13.MetadataRequestTopic = .{.{
+        .topic_id = @splat(0),
+        .name = "topic",
+    }};
+    const request = protocol.MetadataRequestV13{
+        .topics = &topics,
+        .allow_auto_topic_creation = false,
+        .include_topic_authorized_operations = true,
+    };
+
+    const allocator = std.testing.allocator;
+    var allocating: AllocatingWriter = .init(allocator);
+    defer allocating.deinit();
+
+    try request.serialise(&allocating.writer);
+
+    const bytes = allocating.written();
+
+    const expected_bytes = &[_]u8{
+        0x02, // length 1 + 1
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 1st 8 bytes uuid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 2nd 8 bytes uuid
+        0x06, // length 5 + 1
+        't', 'o', 'p', 'i', 'c', // topic name
+        0x00, // no tagged fields
+        0x00, // false
+        0x01, // true
+        0x00, // empty tagged fields buffer
+    };
+
+    try std.testing.expectEqualSlices(u8, expected_bytes, bytes);
 }

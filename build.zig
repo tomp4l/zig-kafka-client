@@ -163,9 +163,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const generate_protocol_step = b.addRunArtifact(generate_protocol);
+    generate_protocol_step.addDirectoryArg(b.path("protocol"));
     const generate_protocol_output = generate_protocol_step.addOutputFileArg("protocol.zig");
 
-    exe.root_module.addAnonymousImport("protocol", .{
+    mod.addAnonymousImport("protocol", .{
         .root_source_file = generate_protocol_output,
     });
 }

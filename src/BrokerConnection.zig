@@ -1,21 +1,33 @@
 const std = @import("std");
+const protocol = @import("protocol");
 const Io = std.Io;
 
 const Self = @This();
 
-// correlation ID to request mapping
 inflight_requests_mutex: std.Io.Mutex = .init,
 write_mutex: std.Io.Mutex = .init,
 
+// correlation ID to request mapping
 inflight_requests: std.AutoHashMapUnmanaged(u32, *InFlightRequest) = .empty,
+valid_versions: std.AutoHashMapUnmanaged(i16, VersionRange) = .empty,
+
 correlation_id: std.atomic.Value(u32) = .init(0),
 read_future: ?Io.Future(void) = null,
 read_error: ?anyerror = null,
 
 client_id: ?[]const u8 = null,
 
+//TODO Pull from build.zig.zon?
+client_software_name: []const u8 = "zig-kafka-client",
+client_software_version: []const u8 = "0.0.1",
+
 reader: *Io.Reader,
 writer: *Io.Writer,
+
+const VersionRange = struct {
+    min: i16,
+    max: i16,
+};
 
 pub fn init(reader: *Io.Reader, writer: *Io.Writer) Self {
     return .{
@@ -29,9 +41,41 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
 
     self.client_id = client_id;
     self.read_future = try io.concurrent(readResponses, .{ self, io, allocator });
+
+    const api_version_request: protocol.ApiVersionsRequestV4 = .{
+        .client_software_name = self.client_software_name,
+        .client_software_version = self.client_software_version,
+    };
+    // todo version downgrade
+    var versions = try self.makeRequestInternal(
+        protocol.ApiVersionsResponseV4,
+        io,
+        allocator,
+        api_version_request,
+        false,
+    );
+    defer versions.deinit();
+
+    if (versions.value.error_code != .NONE) {
+        std.log.err("Failed to get versions: {}", .{versions.value.error_code});
+        return error.VersionDiscoveryFailed;
+    }
+
+    {
+        try self.write_mutex.lock(io);
+        defer self.write_mutex.unlock(io);
+
+        for (versions.value.api_keys) |api_key| {
+            try self.valid_versions.put(
+                allocator,
+                api_key.api_key,
+                .{ .min = api_key.min_version, .max = api_key.max_version },
+            );
+        }
+    }
 }
 
-pub fn close(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     if (self.read_future) |*f| f.cancel(io);
 
     self.inflight_requests_mutex.lock(io) catch {
@@ -40,6 +84,13 @@ pub fn close(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     defer self.inflight_requests_mutex.unlock(io);
 
     self.inflight_requests.deinit(allocator);
+
+    self.write_mutex.lock(io) catch {
+        return;
+    };
+
+    self.valid_versions.deinit(allocator);
+    self.read_error = null;
 }
 
 const InFlightRequest = struct {
@@ -58,10 +109,11 @@ pub fn KafkaResponse(comptime T: type) type {
     return struct {
         value: T,
         raw_buffer: []const u8,
-        allocator: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
 
         pub fn deinit(self: *@This()) void {
-            self.allocator.free(self.raw_buffer);
+            self.arena.child_allocator.free(self.raw_buffer);
+            self.arena.deinit();
         }
     };
 }
@@ -77,8 +129,49 @@ fn cleanOutstandingRequest(self: *Self, io: Io, correlation_id: u32) void {
 // why is this special :(
 const API_VERSION_KEY = 18;
 
-pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !KafkaResponse(ResponseType) {
+pub fn makeRequest(
+    self: *Self,
+    ResponseType: type,
+    io: Io,
+    allocator: std.mem.Allocator,
+    request: anytype,
+) !KafkaResponse(ResponseType) {
+    return makeRequestInternal(
+        self,
+        ResponseType,
+        io,
+        allocator,
+        request,
+        true,
+    );
+}
+
+// Makes a kafka request, if validate_version is true also validates against this connections supported versions.
+fn makeRequestInternal(
+    self: *Self,
+    ResponseType: type,
+    io: Io,
+    allocator: std.mem.Allocator,
+    request: anytype,
+    comptime validate_version: bool,
+) !KafkaResponse(ResponseType) {
     const RequestType = @TypeOf(request);
+    if (validate_version) {
+        try self.write_mutex.lock(io);
+        defer self.write_mutex.unlock(io);
+        if (self.valid_versions.count() == 0 or self.read_future == null) {
+            return error.ConnectionClosed;
+        }
+
+        if (self.valid_versions.get(RequestType.api_key)) |versions| {
+            if (versions.min > RequestType.version or versions.max < RequestType.version) {
+                return error.UnsupportedVersion;
+            }
+        } else {
+            return error.UnsupportedVersion;
+        }
+    }
+
     var in_flight: InFlightRequest = .{ .response_header_flexible = RequestType.is_flexible and RequestType.api_key != API_VERSION_KEY };
     const correlation_id = self.getNextCorrelationId();
     {
@@ -103,7 +196,11 @@ pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.A
 
     {
         try self.write_mutex.lock(io);
-        defer self.write_mutex.unlock(io);
+        self.write_mutex.unlock(io);
+
+        if (validate_version and self.valid_versions.count() == 0 or self.read_future == null) {
+            return error.ConnectionClosed;
+        }
 
         try self.writer.writeInt(u32, @truncate(size), .big);
         try self.writer.writeInt(u16, RequestType.api_key, .big);
@@ -132,10 +229,14 @@ pub fn makeRequest(self: *Self, ResponseType: type, io: Io, allocator: std.mem.A
         .errored => return error.ConnectionClosed,
     }
 
+    errdefer allocator.free(in_flight.response);
+    var value_arena: std.heap.ArenaAllocator = .init(allocator);
+    errdefer value_arena.deinit();
+    const value = try ResponseType.deserialise(value_arena.allocator(), in_flight.response);
     return .{
-        .allocator = allocator,
+        .arena = value_arena,
         .raw_buffer = in_flight.response,
-        .value = try ResponseType.deserialise(allocator, in_flight.response),
+        .value = value,
     };
 }
 
@@ -248,10 +349,46 @@ test "fake request / response" {
 
     const allocator = std.testing.allocator;
 
-    var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
-    defer client.close(io, allocator);
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
+    defer connection.deinit(io, allocator);
+    connection.client_software_name = "";
+    connection.client_software_version = "";
 
-    try client.connect(io, allocator, null);
+    var connect_future = try io.concurrent(connect, .{ &connection, io, allocator, null });
+
+    const bytes = try output_pipe.reader.take(18);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x0E, // 14 bytes
+        0x00, 0x12, // api key 18
+        0x00, 0x04, // version 4
+        0x00, 0x00, 0x00, 0x00, // correlation_id 1
+        0xFF, 0xFF, // null client id
+        0x00, // 0 flex headers
+        0x01, // empty client software name (this is invalid but whatever)
+        0x01, // empty client software version
+        0x00, // 0 flex fields
+    }, bytes);
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 19, // 19 bytes
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+
+        0x00, 0x00, // 1. error_code: i16 (0)
+
+        0x02, // 2. api_keys compact array: (1 item -> encoded as length + 1 = 2)
+        // --- ApiVersion[0] ---
+        0x00, 0x69, // api_key (105)
+        0x00, 0x00, // min_version (0)
+        0x00, 0x05, // max_version (5)
+        0x00, // TAG BUFFER (0 tags) for the ApiVersion struct
+        // --- End ApiVersion[0] ---
+
+        0x00, 0x00, 0x00, 0x00, // 3. throttle_time_ms: i32 (0)
+
+        0x00, // Num Tags: 0
+    });
+
+    try connect_future.await(io);
 
     const fake_request: FakeRequest = .{};
 
@@ -262,13 +399,13 @@ test "fake request / response" {
         }
     };
 
-    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &client, io, allocator, fake_request });
+    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
 
     _ = try output_pipe.reader.peek(1);
 
     try input_pipe.sendData(&.{
         0x00, 0x00, 0x00, 0x0a, // 10 bytes
-        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, 0x00, 0x00, 0x01, // correlation id 1
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 6 junk bytes
     });
 
@@ -281,7 +418,7 @@ test "fake request / response" {
         0x00, 0x00, 0x00, 0x0F, // 15 bytes
         0x00, 0x69, // api key
         0x00, 0x02, // version
-        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, 0x00, 0x00, 0x01, // correlation id 1
         0xFF, 0xFF, // null client id
         'h', 'e', 'l', 'l', 'o', // dummy payload
     }, try output_pipe.reader.take(19));
@@ -319,10 +456,39 @@ test "it propogates errors" {
 
     const allocator = std.testing.allocator;
 
-    var client: Self = .init(&input_pipe.reader, &output_pipe.writer);
-    defer client.close(io, allocator);
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
+    defer connection.deinit(io, allocator);
+    connection.client_software_name = "";
+    connection.client_software_version = "";
 
-    try client.connect(io, allocator, null);
+    var connect_future = try io.concurrent(connect, .{ &connection, io, allocator, null });
+
+    const bytes = try output_pipe.reader.take(18);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x0E, // 14 bytes
+        0x00, 0x12, // api key 18
+        0x00, 0x04, // version 4
+        0x00, 0x00, 0x00, 0x00, // correlation_id 1
+        0xFF, 0xFF, // null client id
+        0x00, // 0 flex headers
+        0x01, // empty client software name
+        0x01, // empty client software version
+        0x00, // 0 flex fields
+    }, bytes);
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 12, // 12 bytes
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, 0x00, // 1. error_code: i16 (0)
+        0x01, // 2. api_keys compact array: (0 items)
+        0x00, 0x00, 0x00, 0x00, // 3. throttle_time_ms: i32 (0)
+        0x00, // Num Tags: 0
+    });
+
+    try connect_future.await(io);
+
+    try connection.valid_versions.put(allocator, FakeRequest.api_key, .{ .min = 0, .max = 10 });
 
     const fake_request: FakeRequest = .{};
 
@@ -333,13 +499,13 @@ test "it propogates errors" {
         }
     };
 
-    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &client, io, allocator, fake_request });
+    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
 
     _ = try output_pipe.reader.peek(1);
 
     try input_pipe.sendData(&.{
         0x00, 0x00, 0x00, 0x0a, // 10 bytes
-        0x00, 0x00, 0x00, 0x00, // correlation id 0
+        0x00, 0x00, 0x00, 0x01, // correlation id 0
         0x00, // incomplete body
     });
 

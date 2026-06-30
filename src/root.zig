@@ -4,6 +4,8 @@ const Io = std.Io;
 
 pub const BrokerConnection = @import("BrokerConnection.zig");
 
+pub const protocol = @import("protocol");
+
 test {
     _ = @import("testing/Pipe.zig");
 
