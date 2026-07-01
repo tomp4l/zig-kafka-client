@@ -3,6 +3,7 @@ const std = @import("std");
 const Io = std.Io;
 
 pub const BrokerConnection = @import("BrokerConnection.zig");
+pub const Cluster = @import("cluster.zig").Cluster;
 
 pub const protocol = @import("protocol");
 

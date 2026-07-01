@@ -6,26 +6,31 @@ const kafka_client = @import("kafka_client");
 const protocol = kafka_client.protocol;
 
 pub fn main(init: std.process.Init) !void {
-    const host_name = try Io.net.HostName.init("localhost");
-
     const arena = init.arena.allocator();
     const io = init.io;
 
-    const socket = try host_name.connect(init.io, 9092, .{ .mode = .stream });
-    defer socket.close(init.io);
+    // const host_name = try Io.net.HostName.init("localhost");
 
-    var read_buf: [4096]u8 = undefined;
-    var write_buf: [4096]u8 = undefined;
+    // const socket = try host_name.connect(init.io, 9092, .{ .mode = .stream });
+    // defer socket.close(init.io);
 
-    var reader = socket.reader(init.io, &read_buf);
-    var writer = socket.writer(init.io, &write_buf);
+    // var read_buf: [4096]u8 = undefined;
+    // var write_buf: [4096]u8 = undefined;
 
-    var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
-    defer connection.deinit(io, arena);
+    // var reader = socket.reader(init.io, &read_buf);
+    // var writer = socket.writer(init.io, &write_buf);
 
-    try connection.connect(io, arena, "client_id");
+    // var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
+    // defer connection.deinit(io, arena);
+    // try connection.connect(io, arena, "client_id");
+    // try testMetadataRequest(io, arena, &connection);
 
-    try testMetadataRequest(io, arena, &connection);
+    var cluster = kafka_client.Cluster.init();
+
+    try cluster.bootstrap(io, arena, .single("localhost", 9092));
+    defer cluster.deinit(io, arena);
+
+    std.debug.print("made {} connections\n", .{cluster.node_map.count()});
 }
 
 fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_client.BrokerConnection) !void {

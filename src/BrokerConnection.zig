@@ -78,16 +78,13 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
 pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     if (self.read_future) |*f| f.cancel(io);
 
-    self.inflight_requests_mutex.lock(io) catch {
-        return;
-    };
+    self.inflight_requests_mutex.lockUncancelable(io);
     defer self.inflight_requests_mutex.unlock(io);
 
     self.inflight_requests.deinit(allocator);
 
-    self.write_mutex.lock(io) catch {
-        return;
-    };
+    self.write_mutex.lockUncancelable(io);
+    defer self.write_mutex.unlock(io);
 
     self.valid_versions.deinit(allocator);
     self.read_error = null;
