@@ -27,11 +27,13 @@ const ConnectedNode = struct {
             .mode = .stream,
             .timeout = .none,
         });
+        errdefer self.connection.close(io);
 
         self.socket_reader = self.connection.reader(io, &self.socket_read_buffer);
         self.socket_writer = self.connection.writer(io, &self.socket_write_buffer);
 
         self.broker_connection = .init(&self.socket_reader.interface, &self.socket_writer.interface);
+        errdefer self.broker_connection.deinit(io, allocator);
         // todo client id
         try self.broker_connection.connect(io, allocator, null);
 
@@ -49,6 +51,25 @@ const ConnectedNode = struct {
     }
 };
 
+const BrokerConfig = struct {
+    host: []const u8,
+    port: u16,
+};
+
+pub const BootstrapConfig = struct {
+    broker_config: BrokerConfig,
+    pub fn single(host: []const u8, port: u16) @This() {
+        return .{ .broker_config = .{
+            .host = host,
+            .port = port,
+        } };
+    }
+};
+
+const TopicConfig = struct {};
+
+const TopicMap = std.AutoHashMapUnmanaged([]const u8, TopicConfig);
+
 pub const Cluster = GenericCluster(ConnectedNode);
 
 fn GenericCluster(NodeType: type) type {
@@ -57,6 +78,10 @@ fn GenericCluster(NodeType: type) type {
 
         connection_mutex: Io.Mutex = .init,
         node_map: std.AutoHashMapUnmanaged(i32, *NodeType) = .empty,
+
+        // lazily populated on write
+        topic_config_mutex: std.Io.Mutex = .init,
+        topic_config: TopicMap = .empty,
 
         pub fn init() Self {
             return .{};
@@ -71,22 +96,10 @@ fn GenericCluster(NodeType: type) type {
             }
 
             self.node_map.deinit(allocator);
+
+            self.topic_config_mutex.lockUncancelable(io);
+            self.topic_config.deinit(allocator);
         }
-
-        const BrokerConfig = struct {
-            host: []const u8,
-            port: u16,
-        };
-
-        pub const BootstrapConfig = struct {
-            broker_config: BrokerConfig,
-            pub fn single(host: []const u8, port: u16) @This() {
-                return .{ .broker_config = .{
-                    .host = host,
-                    .port = port,
-                } };
-            }
-        };
 
         pub fn bootstrap(self: *Self, io: Io, allocator: std.mem.Allocator, config: BootstrapConfig) !void {
             try self.connection_mutex.lock(io);
@@ -98,6 +111,7 @@ fn GenericCluster(NodeType: type) type {
             const last_server = config.broker_config;
 
             const host_name = try HostName.init(last_server.host);
+
             var connected_node = try NodeType.init(io, allocator, host_name, last_server.port);
             errdefer connected_node.deinit(io, allocator);
 
@@ -106,8 +120,13 @@ fn GenericCluster(NodeType: type) type {
                 .include_topic_authorized_operations = false,
             };
 
-            var response = try connected_node.makeRequest(protocol.MetadataResponseV13, io, allocator, req);
+            const Response = BrokerConnection.KafkaResponse(protocol.MetadataResponseV13);
+            var response: Response = try connected_node.makeRequest(protocol.MetadataResponseV13, io, allocator, req);
             defer response.deinit();
+
+            if (response.value.error_code != .NONE) {
+                return error.FailedMetadataRequest;
+            }
 
             var reused_connection = false;
 
@@ -181,6 +200,8 @@ test "cluster bootstrap" {
             _ = request;
 
             const response = try arena.create(protocol.MetadataResponseV13);
+
+            response.error_code = .NONE;
             response.brokers = try arena.alloc(protocol.MetadataResponseV13.MetadataResponseBroker, 2);
 
             response.brokers[0] = .{

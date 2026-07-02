@@ -4,12 +4,17 @@ const Io = std.Io;
 
 const Self = @This();
 
+const VersionMap = std.AutoHashMapUnmanaged(i16, VersionRange);
+
 inflight_requests_mutex: std.Io.Mutex = .init,
 write_mutex: std.Io.Mutex = .init,
 
 // correlation ID to request mapping
 inflight_requests: std.AutoHashMapUnmanaged(u32, *InFlightRequest) = .empty,
-valid_versions: std.AutoHashMapUnmanaged(i16, VersionRange) = .empty,
+inflight_request_count: usize = 0,
+inflight_request_cond: std.Io.Condition = .init,
+
+valid_versions: std.atomic.Value(?*VersionMap) = .init(null),
 
 correlation_id: std.atomic.Value(u32) = .init(0),
 read_future: ?Io.Future(void) = null,
@@ -23,6 +28,8 @@ client_software_version: []const u8 = "0.0.1",
 
 reader: *Io.Reader,
 writer: *Io.Writer,
+
+timeout: Io.Duration = .fromSeconds(30),
 
 const VersionRange = struct {
     min: i16,
@@ -46,6 +53,7 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
         .client_software_name = self.client_software_name,
         .client_software_version = self.client_software_version,
     };
+
     // todo version downgrade
     var versions = try self.makeRequestInternal(
         protocol.ApiVersionsResponseV4,
@@ -61,24 +69,32 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
         return error.VersionDiscoveryFailed;
     }
 
-    {
-        try self.write_mutex.lock(io);
-        defer self.write_mutex.unlock(io);
+    var valid_versions = try allocator.create(VersionMap);
+    valid_versions.* = .empty;
 
-        for (versions.value.api_keys) |api_key| {
-            try self.valid_versions.put(
-                allocator,
-                api_key.api_key,
-                .{ .min = api_key.min_version, .max = api_key.max_version },
-            );
-        }
+    errdefer {
+        self.valid_versions.store(null, .release);
+        valid_versions.deinit(allocator);
     }
+
+    for (versions.value.api_keys) |api_key| {
+        try valid_versions.put(
+            allocator,
+            api_key.api_key,
+            .{ .min = api_key.min_version, .max = api_key.max_version },
+        );
+    }
+
+    self.valid_versions.store(valid_versions, .release);
 }
 
 pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     if (self.read_future) |*f| f.cancel(io);
 
     self.inflight_requests_mutex.lockUncancelable(io);
+    while (self.inflight_request_count > 0) {
+        self.inflight_request_cond.waitUncancelable(io, &self.inflight_requests_mutex);
+    }
     defer self.inflight_requests_mutex.unlock(io);
 
     self.inflight_requests.deinit(allocator);
@@ -86,7 +102,12 @@ pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     self.write_mutex.lockUncancelable(io);
     defer self.write_mutex.unlock(io);
 
-    self.valid_versions.deinit(allocator);
+    if (self.valid_versions.load(.acquire)) |valid_versions| {
+        self.valid_versions.store(null, .release);
+        valid_versions.deinit(allocator);
+        allocator.destroy(valid_versions);
+    }
+
     self.read_error = null;
 }
 
@@ -100,6 +121,7 @@ const RequestState = enum(u32) {
     started,
     completed,
     errored,
+    timeout,
 };
 
 pub fn KafkaResponse(comptime T: type) type {
@@ -143,6 +165,19 @@ pub fn makeRequest(
     );
 }
 
+fn timeoutRequest(self: *Self, io: Io, correlation_id: u32) void {
+    io.sleep(self.timeout, .real) catch |err| switch (err) {
+        error.Canceled => return,
+    };
+    self.inflight_requests_mutex.lockUncancelable(io);
+    defer self.inflight_requests_mutex.unlock(io);
+    const maybe_request = self.inflight_requests.fetchRemove(correlation_id);
+    if (maybe_request) |kv| {
+        kv.value.request_state.store(.timeout, .release);
+        io.futexWake(RequestState, &kv.value.request_state.raw, 1);
+    }
+}
+
 // Makes a kafka request, if validate_version is true also validates against this connections supported versions.
 fn makeRequestInternal(
     self: *Self,
@@ -153,19 +188,36 @@ fn makeRequestInternal(
     comptime validate_version: bool,
 ) !KafkaResponse(ResponseType) {
     const RequestType = @TypeOf(request);
-    if (validate_version) {
+    {
         try self.write_mutex.lock(io);
         defer self.write_mutex.unlock(io);
-        if (self.valid_versions.count() == 0 or self.read_future == null) {
+        if (self.read_future == null) {
             return error.ConnectionClosed;
         }
+    }
 
-        if (self.valid_versions.get(RequestType.api_key)) |versions| {
-            if (versions.min > RequestType.version or versions.max < RequestType.version) {
+    try self.inflight_requests_mutex.lock(io);
+    self.inflight_request_count += 1;
+    self.inflight_requests_mutex.unlock(io);
+    defer {
+        self.inflight_requests_mutex.lockUncancelable(io);
+        self.inflight_request_count -= 1;
+        self.inflight_requests_mutex.unlock(io);
+
+        self.inflight_request_cond.signal(io);
+    }
+
+    if (validate_version) {
+        if (self.valid_versions.load(.acquire)) |valid_versions| {
+            if (valid_versions.get(RequestType.api_key)) |versions| {
+                if (versions.min > RequestType.version or versions.max < RequestType.version) {
+                    return error.UnsupportedVersion;
+                }
+            } else {
                 return error.UnsupportedVersion;
             }
         } else {
-            return error.UnsupportedVersion;
+            return error.ConnectionClosed;
         }
     }
 
@@ -195,7 +247,7 @@ fn makeRequestInternal(
         try self.write_mutex.lock(io);
         self.write_mutex.unlock(io);
 
-        if (validate_version and self.valid_versions.count() == 0 or self.read_future == null) {
+        if (self.read_future == null) {
             return error.ConnectionClosed;
         }
 
@@ -203,6 +255,7 @@ fn makeRequestInternal(
         try self.writer.writeInt(u16, RequestType.api_key, .big);
         try self.writer.writeInt(u16, RequestType.version, .big);
         try self.writer.writeInt(u32, correlation_id, .big);
+
         if (self.client_id) |client_id| {
             try self.writer.writeInt(i16, @intCast(@as(u15, @truncate(client_id.len))), .big);
             try self.writer.writeAll(client_id);
@@ -213,20 +266,30 @@ fn makeRequestInternal(
             try self.writer.writeByte(0x00);
         }
         try request.serialise(self.writer);
+
         try self.writer.flush();
     }
+
+    var future_timeout = try io.concurrent(
+        timeoutRequest,
+        .{ self, io, correlation_id },
+    );
+    defer future_timeout.cancel(io);
 
     // this can have timeout but worry later
     while (in_flight.request_state.load(.acquire) == .started)
         try io.futexWait(RequestState, &in_flight.request_state.raw, .started);
     const new_state = in_flight.request_state.load(.acquire);
+
     switch (new_state) {
         .started => unreachable,
         .completed => {},
         .errored => return error.ConnectionClosed,
+        .timeout => return error.Timeout,
     }
 
     errdefer allocator.free(in_flight.response);
+
     var value_arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer value_arena.deinit();
     const value = try ResponseType.deserialise(value_arena.allocator(), in_flight.response);
@@ -485,7 +548,7 @@ test "it propogates errors" {
 
     try connect_future.await(io);
 
-    try connection.valid_versions.put(allocator, FakeRequest.api_key, .{ .min = 0, .max = 10 });
+    try connection.valid_versions.load(.acquire).?.put(allocator, FakeRequest.api_key, .{ .min = 0, .max = 10 });
 
     const fake_request: FakeRequest = .{};
 
@@ -509,4 +572,28 @@ test "it propogates errors" {
     input_pipe.close();
 
     try std.testing.expectError(error.ConnectionClosed, future_response.await(io));
+}
+
+test "it times out" {
+    const Pipe = @import("testing/Pipe.zig");
+    const io = std.testing.io;
+
+    var input_buffers: Pipe.DefaultPipeBuffers = .init;
+    var input_pipe: Pipe = .initWithBuffers(io, &input_buffers);
+    defer input_pipe.close();
+
+    var output_buffer: [1024]u8 = undefined;
+    var output_writer = Io.Writer.Discarding.init(&output_buffer);
+
+    const allocator = std.testing.allocator;
+
+    var connection: Self = .init(&input_pipe.reader, &output_writer.writer);
+    defer connection.deinit(io, allocator);
+    connection.client_software_name = "";
+    connection.client_software_version = "";
+    connection.timeout = .fromNanoseconds(1);
+
+    const result = connection.connect(io, allocator, null);
+
+    try std.testing.expectError(error.Timeout, result);
 }
