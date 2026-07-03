@@ -13,3 +13,5 @@ A native Kafka client built from scratch in Zig 0.16. This project builds on `st
 
 - Create a usable client interface around the raw broker connections.
 - Generate more message types and get a working consumer / producer set up.
+
+_This project is licensed under the MIT License. Certain files imported from Apache Kafka are licensed under the Apache License 2.0. See the LICENSE-APACHE and NOTICE files for details._

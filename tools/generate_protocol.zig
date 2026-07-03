@@ -7,10 +7,10 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(arena);
 
-    if (args.len != 3) fatal("wrong number of arguments", .{});
+    if (args.len < 3) fatal("wrong number of arguments", .{});
 
-    const input_file_directory = args[1];
-    const output_file_path = args[2];
+    const output_file_path = args[1];
+    const input_files = args[2..];
 
     var output_file = Io.Dir.cwd().createFile(io, output_file_path, .{}) catch |err| {
         fatal("unable to open '{s}': {s}", .{ output_file_path, @errorName(err) });
@@ -21,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     const writer = &file_writer.interface;
     std.log.debug("protocol out file: {s}", .{output_file_path});
 
-    generateAllStructs(io, arena, writer, input_file_directory) catch |err| {
+    generateAllStructs(io, arena, writer, input_files) catch |err| {
         fatal("unable to generate files '{s}': {s}", .{ output_file_path, @errorName(err) });
     };
 
@@ -307,7 +307,7 @@ fn writeErrorEnum(writer: *Io.Writer) !void {
     );
 }
 
-fn generateAllStructs(io: Io, arena: std.mem.Allocator, writer: *Io.Writer, input_path: []const u8) !void {
+fn generateAllStructs(io: Io, arena: std.mem.Allocator, writer: *Io.Writer, input_files: []const []const u8) !void {
     try writer.writeAll("const std = @import(\"std\");");
 
     try writeErrorEnum(writer);
@@ -352,19 +352,13 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, writer: *Io.Writer, inpu
         \\   }
     );
 
-    var inputs = try Io.Dir.cwd().openDir(io, input_path, .{
-        .iterate = true,
-    });
-    std.log.debug("protocol input dir: {s}", .{try inputs.realPathFileAlloc(io, ".", arena)});
-
-    var iter = inputs.iterate();
-
     var buffer: [1024]u8 = undefined;
+    var cwd = Io.Dir.cwd();
 
-    while (try iter.next(io)) |file| {
-        std.log.debug("protocol file: {s}", .{file.name});
+    for (input_files) |file| {
+        std.log.debug("protocol file: {s}", .{file});
 
-        const input = try inputs.openFile(io, file.name, .{ .allow_directory = false });
+        const input = try cwd.openFile(io, file, .{ .allow_directory = false });
         var reader = input.readerStreaming(io, &buffer);
 
         var file_content: std.ArrayList(u8) = .empty;
@@ -374,7 +368,11 @@ fn generateAllStructs(io: Io, arena: std.mem.Allocator, writer: *Io.Writer, inpu
                 error.EndOfStream => break,
                 else => return err,
             };
-            reader.interface.toss(1);
+
+            reader.interface.discardAll(1) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
 
             var is_comment = false;
             for (line) |c| {
@@ -556,6 +554,9 @@ fn getImplicitDefault(field: ProtocolField, version: usize) ![]const u8 {
     if (std.mem.eql(u8, field.type, "float64")) return "0.0";
     if (std.mem.eql(u8, field.type, "uuid")) return "@splat(0)";
 
+    // TODO handle sub types properly
+    if (field.type[0] >= 'A' and field.type[0] <= 'Z') return ".{}";
+
     // Strings, bytes, records, and arrays defaults to empty slices
     return "&.{}";
 }
@@ -683,7 +684,11 @@ fn createDeserialiseField(
     if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
 
     // Fallback for custom nested arrays (e.g. "[]Topic")
-    try createDeserialiseArray(field, is_flexible, writer);
+    if (kafka_type.len > 2 and kafka_type[0] == '[' and kafka_type[1] == ']') {
+        try createDeserialiseArray(field, is_flexible, writer);
+    } else {
+        try createDeserialiseType(field, writer);
+    }
     return true;
 }
 
@@ -704,12 +709,23 @@ fn createDeserialiseUuid(
     return false;
 }
 
+fn createDeserialiseType(field: ProtocolField, writer: *Io.Writer) !void {
+    try writer.print(
+        \\ {{
+        \\   current_offset += try self.{s}.deserialise(allocator, bytes[current_offset..]);
+        \\ }}
+    , .{field.snake_name});
+}
+
 fn createDeserialiseArray(
     field: ProtocolField,
     is_flexible: bool,
     writer: *Io.Writer,
 ) !void {
-    if (!std.mem.eql(u8, "[]", field.type[0..2])) return error.ExpectingArray;
+    if (!std.mem.eql(u8, "[]", field.type[0..2])) {
+        std.log.err("Expecting array but got {s}", .{field.type});
+        return error.ExpectingArray;
+    }
     const kafka_type = field.type[2..];
     const type_name = mapKafkaType(kafka_type);
 
@@ -1124,10 +1140,15 @@ fn mapSubtype(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: u
     const field_versions = try VersionRange.parse(field.versions);
     if (!field_versions.contains(version)) return;
 
-    if (field.type[0] == '[' and field.type[1] == ']') {
-        // skip native types (lowercase start)
-        if (field.type[2] >= 'a' and field.type[2] <= 'z') return;
+    const maybe_sub_type: ?[]const u8 =
+        if (field.type[0] == '[' and field.type[1] == ']' and field.type[2] >= 'A' and field.type[2] <= 'Z')
+            field.type[2..]
+        else if (field.type[0] >= 'A' and field.type[0] <= 'Z')
+            field.type
+        else
+            null;
 
+    if (maybe_sub_type) |sub_type| {
         for (field.fields) |sub_field| {
             try mapSubtype(io, arena, sub_field, version, is_request, is_flexible, writer);
         }
@@ -1135,7 +1156,7 @@ fn mapSubtype(io: Io, arena: std.mem.Allocator, field: ProtocolField, version: u
         try writer.print(
             \\pub const {s} = struct {{
             \\   const version = {};
-        , .{ field.type[2..], version });
+        , .{ sub_type, version });
 
         for (field.fields) |sub_field| {
             try mapField(sub_field, version, writer);

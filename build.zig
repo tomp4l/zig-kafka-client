@@ -163,8 +163,28 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const generate_protocol_step = b.addRunArtifact(generate_protocol);
-    generate_protocol_step.addDirectoryArg(b.path("protocol"));
+
     const generate_protocol_output = generate_protocol_step.addOutputFileArg("protocol.zig");
+
+    var threaded = std.Io.Threaded.init(b.allocator, .{});
+    const io = threaded.io();
+    // Open and iterate the protocol dir at build time
+    var dir = std.Io.Dir.cwd().openDir(io, "protocol", .{ .iterate = true }) catch |err| {
+        std.debug.panic("Failed to open protocol dir: {}", .{err});
+    };
+    defer dir.close(io);
+
+    var it = dir.iterate();
+
+    // Loop through and append every JSON file as a strict cache dependency
+    while (it.next(io) catch unreachable) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
+            const file_path = b.fmt("protocol/{s}", .{entry.name});
+
+            // This strictly binds the file's contents to the cache hash!
+            generate_protocol_step.addFileArg(b.path(file_path));
+        }
+    }
 
     mod.addAnonymousImport("protocol", .{
         .root_source_file = generate_protocol_output,

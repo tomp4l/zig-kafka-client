@@ -30,7 +30,7 @@ pub fn main(init: std.process.Init) !void {
     try cluster.bootstrap(io, arena, .single("localhost", 9092));
     defer cluster.deinit(io, arena);
 
-    std.debug.print("made {} connections\n", .{cluster.node_map.count()});
+    std.debug.print("made {} connections\n", .{cluster.connection_node_map.count()});
 }
 
 fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_client.BrokerConnection) !void {

@@ -20,9 +20,12 @@ const ConnectedNode = struct {
     socket_reader: Io.net.Stream.Reader = undefined,
     socket_writer: Io.net.Stream.Writer = undefined,
 
+    ref_count: std.atomic.Value(usize) = undefined,
+
     fn init(io: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16) !*@This() {
         const self = try allocator.create(@This());
         self.node_id = null;
+        self.ref_count = .init(1);
         self.connection = try host_name.connect(io, port, .{
             .mode = .stream,
             .timeout = .none,
@@ -40,6 +43,16 @@ const ConnectedNode = struct {
         return self;
     }
 
+    fn retain(self: *@This()) void {
+        _ = self.ref_count.fetchAdd(1, .monotonic);
+    }
+
+    fn release(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
+        if (self.ref_count.fetchSub(1, .monotonic) == 1) {
+            self.deinit(io, allocator);
+        }
+    }
+
     fn makeRequest(self: *@This(), ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !BrokerConnection.KafkaResponse(ResponseType) {
         return self.broker_connection.makeRequest(ResponseType, io, allocator, request);
     }
@@ -48,6 +61,7 @@ const ConnectedNode = struct {
         self.broker_connection.deinit(io, allocator);
         self.connection.close(io);
         allocator.destroy(self);
+        self.* = undefined;
     }
 };
 
@@ -66,9 +80,15 @@ pub const BootstrapConfig = struct {
     }
 };
 
-const TopicConfig = struct {};
+const PartitionConfig = struct {
+    leader: i32,
+};
 
-const TopicMap = std.AutoHashMapUnmanaged([]const u8, TopicConfig);
+const TopicConfig = struct {
+    partitions: std.AutoHashMapUnmanaged(i32, PartitionConfig),
+};
+
+const TopicMap = std.StringHashMapUnmanaged(TopicConfig);
 
 pub const Cluster = GenericCluster(ConnectedNode);
 
@@ -77,7 +97,9 @@ fn GenericCluster(NodeType: type) type {
         const Self = @This();
 
         connection_mutex: Io.Mutex = .init,
-        node_map: std.AutoHashMapUnmanaged(i32, *NodeType) = .empty,
+        connection_node_map: std.AutoHashMapUnmanaged(i32, *NodeType) = .empty,
+        connections: std.ArrayList(*NodeType) = .empty,
+        connection_last_used: usize = 0,
 
         // lazily populated on write
         topic_config_mutex: std.Io.Mutex = .init,
@@ -89,22 +111,36 @@ fn GenericCluster(NodeType: type) type {
 
         pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
             self.connection_mutex.lockUncancelable(io);
-            var it = self.node_map.iterator();
 
-            while (it.next()) |entry| {
-                entry.value_ptr.*.deinit(io, allocator);
+            for (self.connections.items) |conn| {
+                conn.release(io, allocator);
             }
 
-            self.node_map.deinit(allocator);
+            self.connection_node_map.deinit(allocator);
+            self.connections.deinit(allocator);
 
             self.topic_config_mutex.lockUncancelable(io);
             self.topic_config.deinit(allocator);
+
+            self.* = undefined;
+        }
+
+        fn nextUnusedConnecton(self: *const Self, io: Io) !*NodeType {
+            try self.connection_mutex.lock(io);
+            defer self.connection_mutex.unlock(io);
+            if (self.connections.items.len == 0) return error.NotBootstrapped;
+            self.connection_last_used += 1;
+            self.connection_last_used %= self.connections.items.len;
+            const conn = self.connections.items[self.connection_last_used];
+            conn.retain();
+
+            return conn;
         }
 
         pub fn bootstrap(self: *Self, io: Io, allocator: std.mem.Allocator, config: BootstrapConfig) !void {
             try self.connection_mutex.lock(io);
             defer self.connection_mutex.unlock(io);
-            if (self.node_map.count() > 0) return error.AlreadyBootstrapped;
+            if (self.connection_node_map.count() > 0) return error.AlreadyBootstrapped;
 
             // if we provide more we can try them first here
 
@@ -113,7 +149,7 @@ fn GenericCluster(NodeType: type) type {
             const host_name = try HostName.init(last_server.host);
 
             var connected_node = try NodeType.init(io, allocator, host_name, last_server.port);
-            errdefer connected_node.deinit(io, allocator);
+            errdefer connected_node.release(io, allocator);
 
             const req = protocol.MetadataRequestV13{
                 .topics = &.{},
@@ -135,7 +171,8 @@ fn GenericCluster(NodeType: type) type {
                     @as(i32, @intCast(last_server.port)) == broker.port)
                 {
                     reused_connection = true;
-                    try self.node_map.put(allocator, broker.node_id, connected_node);
+                    try self.connection_node_map.put(allocator, broker.node_id, connected_node);
+                    try self.connections.append(allocator, connected_node);
                 } else {
                     const node_host_name = try HostName.init(broker.host);
 
@@ -144,13 +181,14 @@ fn GenericCluster(NodeType: type) type {
                     }
 
                     var new_connected_node = try NodeType.init(io, allocator, node_host_name, @intCast(broker.port));
-                    errdefer new_connected_node.deinit(io, allocator);
-                    try self.node_map.put(allocator, broker.node_id, new_connected_node);
+                    errdefer new_connected_node.release(io, allocator);
+                    try self.connection_node_map.put(allocator, broker.node_id, new_connected_node);
+                    try self.connections.append(allocator, new_connected_node);
                 }
             }
 
             if (!reused_connection) {
-                connected_node.deinit(io, allocator);
+                connected_node.release(io, allocator);
             }
         }
     };
@@ -186,7 +224,11 @@ fn FakeConnection(mockFn: anytype) type {
             return BrokerConnection.KafkaResponse(ResponseType){ .arena = arena, .raw_buffer = &.{}, .value = response_cast.* };
         }
 
-        fn deinit(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
+        fn retain(self: *@This()) void {
+            _ = self;
+        }
+
+        fn release(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
             _ = io;
             allocator.free(self.host_name);
             allocator.destroy(self);
@@ -228,9 +270,9 @@ test "cluster bootstrap" {
 
     try cluster.bootstrap(io, allocator, .single("localhost", 1234));
 
-    const node1 = cluster.node_map.get(1) orelse return error.MissingNode;
-    const node2 = cluster.node_map.get(2) orelse return error.MissingNode;
-    const node3 = cluster.node_map.get(3);
+    const node1 = cluster.connection_node_map.get(1) orelse return error.MissingNode;
+    const node2 = cluster.connection_node_map.get(2) orelse return error.MissingNode;
+    const node3 = cluster.connection_node_map.get(3);
 
     try std.testing.expectEqual(0, node1.id);
     try std.testing.expectEqualStrings("localhost", node1.host_name);
@@ -241,4 +283,8 @@ test "cluster bootstrap" {
     try std.testing.expectEqual(2345, node2.port);
 
     try std.testing.expectEqual(null, node3);
+}
+
+test {
+    _ = @import("./protocol/RecordSet.zig");
 }

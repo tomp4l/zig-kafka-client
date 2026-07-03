@@ -150,3 +150,68 @@ test "MetadataRequestV13" {
 
     try std.testing.expectEqualSlices(u8, expected_bytes, bytes);
 }
+
+test "ProduceRequestV13" {
+    var partition_data: [1]protocol.ProduceRequestV13.PartitionProduceData = .{
+        .{
+            .index = 1,
+            .records = "records",
+        },
+    };
+
+    var topic_data: [1]protocol.ProduceRequestV13.TopicProduceData = .{
+        .{
+            .topic_id = @splat(0),
+            .partition_data = &partition_data,
+        },
+    };
+
+    const request: protocol.ProduceRequestV13 = .{
+        .acks = -1,
+        .timeout_ms = 1000,
+        .topic_data = &topic_data,
+    };
+
+    const allocator = std.testing.allocator;
+    var allocating: AllocatingWriter = .init(allocator);
+    defer allocating.deinit();
+
+    try request.serialise(&allocating.writer);
+
+    const bytes = allocating.written();
+
+    const expected_bytes = &[_]u8{
+        0x00, // null transaction ID
+        0xFF, 0xFF, // -1 acks (all)
+        0x00, 0x00, 0x03, 0xE8, // 1000ms timeout
+        0x02, // 1 producer record (1+1)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uuid
+        0x02, // 1 partition record (1+1)
+        0x00, 0x00, 0x00, 0x01, // id 1
+        0x08, // record length
+        'r', 'e', 'c', 'o', 'r', 'd', 's', // data
+        0x00, // 0 tags (partition)
+        0x00, // 0 tags (producer)
+        0x00, // 0 tags
+    };
+
+    try std.testing.expectEqualSlices(u8, expected_bytes, bytes);
+}
+
+test "ProduceResponseV13" {
+    const allocator = std.testing.allocator;
+    const mock_payload = [_]u8{
+        0x01, // empty responses
+        0x00, 0x00, 0x00, 0x10, // 16 throttle time
+        0x00, // no tags
+    };
+
+    // Parse the bytes
+    const response = try protocol.ProduceResponseV13.deserialise(allocator, &mock_payload);
+
+    // Verify the scalar field
+    try std.testing.expectEqual(16, response.throttle_time_ms);
+
+    try std.testing.expectEqualSlices(protocol.ProduceResponseV13.TopicProduceResponse, &.{}, response.responses);
+    try std.testing.expectEqualSlices(protocol.ProduceResponseV13.NodeEndpoint, &.{}, response.node_endpoints);
+}
