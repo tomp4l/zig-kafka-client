@@ -7,6 +7,8 @@ pub const Cluster = @import("cluster.zig").Cluster;
 
 pub const protocol = @import("protocol");
 
+pub const RecordSet = @import("./protocol/RecordSet.zig");
+
 test {
     _ = @import("testing/Pipe.zig");
 

@@ -196,6 +196,10 @@ fn makeRequestInternal(
         }
     }
 
+    if (RequestType.api_key != ResponseType.api_key) {
+        @compileError(std.fmt.comptimePrint("Request and response have different api keys: {} vs {}", .{ RequestType.api_key, ResponseType.api_key }));
+    }
+
     try self.inflight_requests_mutex.lock(io);
     self.inflight_request_count += 1;
     self.inflight_requests_mutex.unlock(io);
@@ -289,6 +293,15 @@ fn makeRequestInternal(
     }
 
     errdefer allocator.free(in_flight.response);
+
+    // if (std.log.logEnabled(.debug, .any)) {
+    //     std.log.debug("\n--- RAW RESPONSE HEX DUMP ---\nLength: {d} bytes\n", .{in_flight.response.len});
+    //     for (in_flight.response, 0..) |b, i| {
+    //         std.log.debug("{X:0>2} ", .{b});
+    //         if (i % 16 == 15) std.debug.print("\n", .{});
+    //     }
+    //     std.log.debug("\n-----------------------------\n\n", .{});
+    // }
 
     var value_arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer value_arena.deinit();
@@ -398,6 +411,8 @@ test "fake request / response" {
     };
 
     const FakeResponse = struct {
+        pub const api_key = 0x69;
+
         pub fn deserialise(_: std.mem.Allocator, bytes: []const u8) !@This() {
             if (bytes.len == 6) {
                 return .{};
@@ -508,6 +523,8 @@ test "it propogates errors" {
     };
 
     const FakeResponse = struct {
+        pub const api_key = 1;
+
         pub fn deserialise(_: std.mem.Allocator, bytes: []const u8) !@This() {
             _ = bytes;
             return .{};

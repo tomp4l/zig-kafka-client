@@ -11,16 +11,16 @@ const socket_write_buffer_size = 128 * 1024;
 
 const ConnectedNode = struct {
     node_id: ?i32 = null,
-    broker_connection: BrokerConnection = undefined,
-    connection: Io.net.Stream = undefined,
+    broker_connection: BrokerConnection,
+    connection: Io.net.Stream,
 
-    socket_read_buffer: [socket_read_buffer_size]u8 = undefined,
-    socket_write_buffer: [socket_write_buffer_size]u8 = undefined,
+    socket_read_buffer: [socket_read_buffer_size]u8,
+    socket_write_buffer: [socket_write_buffer_size]u8,
 
-    socket_reader: Io.net.Stream.Reader = undefined,
-    socket_writer: Io.net.Stream.Writer = undefined,
+    socket_reader: Io.net.Stream.Reader,
+    socket_writer: Io.net.Stream.Writer,
 
-    ref_count: std.atomic.Value(usize) = undefined,
+    ref_count: std.atomic.Value(usize) = .init(1),
 
     fn init(io: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16) !*@This() {
         const self = try allocator.create(@This());
@@ -202,13 +202,19 @@ fn FakeConnection(mockFn: anytype) type {
         port: u16,
         id: usize,
 
+        ref_count: std.atomic.Value(usize) = .init(1),
+
         fn init(io_: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16) !*@This() {
             _ = io_;
 
             const self = try allocator.create(@This());
-            self.host_name = try allocator.dupe(u8, host_name.bytes);
-            self.port = port;
-            self.id = global_id.fetchAdd(1, .monotonic);
+
+            self.* = .{
+                .host_name = try allocator.dupe(u8, host_name.bytes),
+                .port = port,
+                .id = global_id.fetchAdd(1, .monotonic),
+            };
+
             return self;
         }
 
@@ -225,13 +231,16 @@ fn FakeConnection(mockFn: anytype) type {
         }
 
         fn retain(self: *@This()) void {
-            _ = self;
+            _ = self.ref_count.fetchAdd(1, .monotonic);
         }
 
         fn release(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
             _ = io;
-            allocator.free(self.host_name);
-            allocator.destroy(self);
+
+            if (self.ref_count.fetchSub(1, .monotonic) == 1) {
+                allocator.free(self.host_name);
+                allocator.destroy(self);
+            }
         }
     };
 }

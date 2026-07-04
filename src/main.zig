@@ -9,31 +9,15 @@ pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
 
-    // const host_name = try Io.net.HostName.init("localhost");
-
-    // const socket = try host_name.connect(init.io, 9092, .{ .mode = .stream });
-    // defer socket.close(init.io);
-
-    // var read_buf: [4096]u8 = undefined;
-    // var write_buf: [4096]u8 = undefined;
-
-    // var reader = socket.reader(init.io, &read_buf);
-    // var writer = socket.writer(init.io, &write_buf);
-
-    // var connection = kafka_client.BrokerConnection.init(&reader.interface, &writer.interface);
-    // defer connection.deinit(io, arena);
-    // try connection.connect(io, arena, "client_id");
-    // try testMetadataRequest(io, arena, &connection);
-
     var cluster = kafka_client.Cluster.init();
 
     try cluster.bootstrap(io, arena, .single("localhost", 9092));
     defer cluster.deinit(io, arena);
 
-    std.debug.print("made {} connections\n", .{cluster.connection_node_map.count()});
+    try testProduce(io, arena, &cluster);
 }
 
-fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_client.BrokerConnection) !void {
+fn testProduce(io: Io, arena: std.mem.Allocator, cluster: *kafka_client.Cluster) !void {
     var topics: [1]protocol.MetadataRequestV13.MetadataRequestTopic = .{.{
         .name = "test",
         .topic_id = @splat(0),
@@ -44,10 +28,10 @@ fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_clie
         .include_topic_authorized_operations = false,
     };
 
-    var response = try connection.makeRequest(protocol.MetadataResponseV13, io, arena, req);
-    defer response.deinit();
+    var metadata_response = try cluster.connections.items[0].broker_connection.makeRequest(protocol.MetadataResponseV13, io, arena, req);
+    defer metadata_response.deinit();
 
-    const value = response.value;
+    const value = metadata_response.value;
 
     std.debug.print("cluster id: {?s}, controller id: {}, throttle time: {}\n\n", .{ value.cluster_id, value.controller_id, value.throttle_time_ms });
 
@@ -57,8 +41,13 @@ fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_clie
 
     std.debug.print("\n", .{});
 
+    var leader_id: i32 = undefined;
+    var topic_id: [16]u8 = undefined;
+    var partition_index: i32 = undefined;
+
     for (value.topics) |topic| {
         std.debug.print("Error: {any}, ID: {x} - {?s}\n", .{ topic.error_code, topic.topic_id, topic.name });
+        topic_id = topic.topic_id;
 
         for (topic.partitions) |partition| {
             std.debug.print("Partition {}: leader: {} in-sync: {any} replicas: {any}\n", .{
@@ -67,9 +56,57 @@ fn testMetadataRequest(io: Io, arena: std.mem.Allocator, connection: *kafka_clie
                 partition.isr_nodes,
                 partition.replica_nodes,
             });
+
+            leader_id = partition.leader_id;
+            partition_index = partition.partition_index;
         }
 
         std.debug.print("\n", .{});
+    }
+
+    const records: kafka_client.RecordSet = .{
+        .partition_leader_epoch = 0,
+        .attributes = .{},
+        .last_offset_delta = 0,
+        .base_timestamp = 0,
+        .max_timestamp = 0,
+        .producer_id = 0,
+        .producer_epoch = 0,
+        .base_sequence = 0,
+        .records = &.{.{
+            .timestamp_delta = 0,
+            .offset_delta = 0,
+            .key = "hello",
+            .value = "world",
+            .headers = &.{},
+        }},
+    };
+    var partition_data: [1]protocol.ProduceRequestV13.PartitionProduceData = .{
+        .{
+            .index = partition_index,
+            .records = try records.serialise(arena),
+        },
+    };
+    var topic_data: [1]protocol.ProduceRequestV13.TopicProduceData = .{
+        .{
+            .topic_id = topic_id,
+            .partition_data = &partition_data,
+        },
+    };
+    const produce_request: protocol.ProduceRequestV13 = .{
+        .acks = -1,
+        .topic_data = &topic_data,
+        .timeout_ms = 30_000,
+    };
+
+    const connection = cluster.connection_node_map.get(leader_id) orelse return error.NoConnection;
+    var produce_response = try connection.broker_connection.makeRequest(protocol.ProduceResponseV13, io, arena, produce_request);
+    defer produce_response.deinit();
+
+    for (produce_response.value.responses) |response| {
+        for (response.partition_responses) |pr| {
+            std.debug.print("error: {any} - {?s} - leader: {any} \n", .{ pr.error_code, pr.error_message, pr.current_leader });
+        }
     }
 }
 
