@@ -117,7 +117,7 @@ pub fn init(
 
 pub const DefaultPipeBuffers = struct {
     reader_buffer: [1024]u8 = undefined,
-    queue_buffer: [8]QueueMessage = undefined,
+    queue_buffer: [32]QueueMessage = undefined,
     socket_buffer: [4096]u8 = undefined,
 
     pub const init: @This() = .{};

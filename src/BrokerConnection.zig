@@ -11,8 +11,8 @@ write_mutex: std.Io.Mutex = .init,
 
 // correlation ID to request mapping
 inflight_requests: std.AutoHashMapUnmanaged(u32, *InFlightRequest) = .empty,
-inflight_request_count: usize = 0,
-inflight_request_cond: std.Io.Condition = .init,
+
+references: std.atomic.Value(usize) = .init(1),
 
 valid_versions: std.atomic.Value(?*VersionMap) = .init(null),
 
@@ -75,6 +75,7 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
     errdefer {
         self.valid_versions.store(null, .release);
         valid_versions.deinit(allocator);
+        allocator.destroy(valid_versions);
     }
 
     for (versions.value.api_keys) |api_key| {
@@ -90,11 +91,15 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
 
 pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     if (self.read_future) |*f| f.cancel(io);
+    self.release(io, allocator);
+}
+
+fn release(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+    if (self.references.fetchSub(1, .monotonic) > 1) {
+        return;
+    }
 
     self.inflight_requests_mutex.lockUncancelable(io);
-    while (self.inflight_request_count > 0) {
-        self.inflight_request_cond.waitUncancelable(io, &self.inflight_requests_mutex);
-    }
     defer self.inflight_requests_mutex.unlock(io);
 
     self.inflight_requests.deinit(allocator);
@@ -200,16 +205,8 @@ fn makeRequestInternal(
         @compileError(std.fmt.comptimePrint("Request and response have different api keys: {} vs {}", .{ RequestType.api_key, ResponseType.api_key }));
     }
 
-    try self.inflight_requests_mutex.lock(io);
-    self.inflight_request_count += 1;
-    self.inflight_requests_mutex.unlock(io);
-    defer {
-        self.inflight_requests_mutex.lockUncancelable(io);
-        self.inflight_request_count -= 1;
-        self.inflight_requests_mutex.unlock(io);
-
-        self.inflight_request_cond.signal(io);
-    }
+    _ = self.references.fetchAdd(1, .monotonic);
+    defer self.release(io, allocator);
 
     if (validate_version) {
         if (self.valid_versions.load(.acquire)) |valid_versions| {
@@ -249,7 +246,7 @@ fn makeRequestInternal(
 
     {
         try self.write_mutex.lock(io);
-        self.write_mutex.unlock(io);
+        defer self.write_mutex.unlock(io);
 
         if (self.read_future == null) {
             return error.ConnectionClosed;
@@ -613,4 +610,130 @@ test "it times out" {
     const result = connection.connect(io, allocator, null);
 
     try std.testing.expectError(error.Timeout, result);
+}
+
+test "concurrent requests" {
+    const Pipe = @import("testing/Pipe.zig");
+    const io = std.testing.io;
+
+    var input_buffers: Pipe.DefaultPipeBuffers = .init;
+    var input_pipe: Pipe = .initWithBuffers(io, &input_buffers);
+    defer input_pipe.close();
+
+    var output_buffers: Pipe.DefaultPipeBuffers = .init;
+    var output_pipe: Pipe = .initWithBuffers(io, &output_buffers);
+    defer output_pipe.close();
+
+    const FakeRequest = struct {
+        pub const version = 2;
+        pub const api_key = 0x69;
+        pub const is_flexible = false;
+
+        pub fn serialise(self: *const @This(), writer: *std.Io.Writer) !void {
+            _ = self;
+            try writer.writeAll("hello");
+        }
+    };
+
+    const FakeResponse = struct {
+        pub const api_key = 0x69;
+
+        pub fn deserialise(_: std.mem.Allocator, bytes: []const u8) !@This() {
+            if (bytes.len == 6) {
+                return .{};
+            } else {
+                return error.UnexpectedInput;
+            }
+        }
+    };
+
+    const allocator = std.testing.allocator;
+
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
+    defer connection.deinit(io, allocator);
+    connection.timeout = .fromMilliseconds(100);
+    connection.client_software_name = "";
+    connection.client_software_version = "";
+
+    var connect_future = try io.concurrent(connect, .{ &connection, io, allocator, null });
+
+    const bytes = try output_pipe.reader.take(18);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x0E, // 14 bytes
+        0x00, 0x12, // api key 18
+        0x00, 0x04, // version 4
+        0x00, 0x00, 0x00, 0x00, // correlation_id 1
+        0xFF, 0xFF, // null client id
+        0x00, // 0 flex headers
+        0x01, // empty client software name (this is invalid but whatever)
+        0x01, // empty client software version
+        0x00, // 0 flex fields
+    }, bytes);
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 19, // 19 bytes
+        0x00, 0x00, 0x00, 0x00, // correlation id 0
+
+        0x00, 0x00, // 1. error_code: i16 (0)
+
+        0x02, // 2. api_keys compact array: (1 item -> encoded as length + 1 = 2)
+        // --- ApiVersion[0] ---
+        0x00, 0x69, // api_key (105)
+        0x00, 0x00, // min_version (0)
+        0x00, 0x05, // max_version (5)
+        0x00, // TAG BUFFER (0 tags) for the ApiVersion struct
+        // --- End ApiVersion[0] ---
+
+        0x00, 0x00, 0x00, 0x00, // 3. throttle_time_ms: i32 (0)
+
+        0x00, // Num Tags: 0
+    });
+
+    try connect_future.await(io);
+
+    const fake_request: FakeRequest = .{};
+
+    const RequestError = anyerror;
+    const Wrapper = struct {
+        fn makeRequest(c: *Self, io_: Io, allocator_: std.mem.Allocator, request: FakeRequest) RequestError!KafkaResponse(FakeResponse) {
+            return c.makeRequest(FakeResponse, io_, allocator_, request);
+        }
+    };
+
+    var future_response1 = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
+
+    var future_response2 = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
+
+    _ = try output_pipe.reader.peek(1);
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 0x0a, // 10 bytes
+        0x00, 0x00, 0x00, 0x01, // correlation id 1
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    });
+
+    try input_pipe.sendData(&.{
+        0x00, 0x00, 0x00, 0x0a, // 10 bytes
+        0x00, 0x00, 0x00, 0x02, // correlation id 2
+        0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00,
+    });
+
+    var response1 = try future_response1.await(io);
+    defer response1.deinit();
+
+    try std.testing.expectEqual(FakeResponse{}, response1.value);
+
+    try std.testing.expectEqualSlices(u8, &.{
+        0x00, 0x00, 0x00, 0x0F, // 15 bytes
+        0x00, 0x69, // api key
+        0x00, 0x02, // version
+        0x00, 0x00, 0x00, 0x01, // correlation id 1
+        0xFF, 0xFF, // null client id
+        'h', 'e', 'l', 'l', 'o', // dummy payload
+    }, try output_pipe.reader.take(19));
+
+    var response2 = try future_response2.await(io);
+    defer response2.deinit();
 }

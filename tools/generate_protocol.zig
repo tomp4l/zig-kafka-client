@@ -422,7 +422,7 @@ fn generateStructVersions(io: Io, arena: std.mem.Allocator, protocol_json: Proto
     }
 }
 
-fn mapKafkaType(kafka_type: []const u8) []const u8 {
+fn mapKafkaType(kafka_type: []const u8, buffer: []u8) []const u8 {
     if (std.mem.eql(u8, kafka_type, "int8")) return "i8";
     if (std.mem.eql(u8, kafka_type, "int16")) return "i16";
     if (std.mem.eql(u8, kafka_type, "int32")) return "i32";
@@ -435,18 +435,24 @@ fn mapKafkaType(kafka_type: []const u8) []const u8 {
     if (std.mem.eql(u8, kafka_type, "float64")) return "f64";
 
     // arrays of basic types
-    if (std.mem.eql(u8, kafka_type, "[]int8")) return "[]i8";
-    if (std.mem.eql(u8, kafka_type, "[]int16")) return "[]i16";
-    if (std.mem.eql(u8, kafka_type, "[]int32")) return "[]i32";
-    if (std.mem.eql(u8, kafka_type, "[]int64")) return "[]i64";
-    if (std.mem.eql(u8, kafka_type, "[]bool")) return "[]bool";
-    if (std.mem.eql(u8, kafka_type, "[]string")) return "[][]const u8";
-    if (std.mem.eql(u8, kafka_type, "[]bytes")) return "[][]const u8";
-    if (std.mem.eql(u8, kafka_type, "[]records")) return "[][]const u8";
-    if (std.mem.eql(u8, kafka_type, "[]uuid")) return "[][16]u8";
-    if (std.mem.eql(u8, kafka_type, "[]float64")) return "[]f64";
+    if (std.mem.eql(u8, kafka_type, "[]int8")) return "[]const i8";
+    if (std.mem.eql(u8, kafka_type, "[]int16")) return "[]const i16";
+    if (std.mem.eql(u8, kafka_type, "[]int32")) return "[]const i32";
+    if (std.mem.eql(u8, kafka_type, "[]int64")) return "[]const i64";
+    if (std.mem.eql(u8, kafka_type, "[]bool")) return "[]const bool";
+    if (std.mem.eql(u8, kafka_type, "[]string")) return "[]const []const u8";
+    if (std.mem.eql(u8, kafka_type, "[]bytes")) return "[]const []const u8";
+    if (std.mem.eql(u8, kafka_type, "[]records")) return "[]const []const u8";
+    if (std.mem.eql(u8, kafka_type, "[]uuid")) return "[]const [16]u8";
+    if (std.mem.eql(u8, kafka_type, "[]float64")) return "[]const f64";
 
-    // Fallback for custom nested arrays (e.g. "[]Topic")
+    // Make arrays of custom types const
+    if (kafka_type.len > 2 and kafka_type[0] == '[' and kafka_type[1] == ']') {
+        return std.fmt.bufPrint(buffer, "[] const {s}", .{kafka_type[2..]}) catch {
+            fatal("buffer too small for type", .{});
+        };
+    }
+    // Fallback for any other custom types
     return kafka_type;
 }
 
@@ -520,6 +526,7 @@ fn createDeserialise(
     writer: *Io.Writer,
 ) !void {
     try writer.writeAll(
+        \\ 
         \\ // leaky deserialize implementation, zero copy for slices
         \\ pub fn deserialise(allocator: std.mem.Allocator, bytes: [] const u8) !@This() {
         \\   var current_offset: usize = 0;
@@ -727,7 +734,8 @@ fn createDeserialiseArray(
         return error.ExpectingArray;
     }
     const kafka_type = field.type[2..];
-    const type_name = mapKafkaType(kafka_type);
+    var format_buffer: [256]u8 = undefined;
+    const type_name = mapKafkaType(kafka_type, &format_buffer);
 
     try writer.writeAll("{");
     if (is_flexible) {
@@ -1179,15 +1187,16 @@ fn mapField(field: ProtocolField, version: usize, writer: *Io.Writer) !void {
     const nullable_versions = if (field.nullableVersions) |v| try VersionRange.parse(v) else VersionRange.none;
 
     const snake_name = field.snake_name;
-    var zig_type = mapKafkaType(field.type);
+
+    var format_buffer: [256]u8 = undefined;
+
+    var zig_type = mapKafkaType(field.type, &format_buffer);
 
     if (std.mem.eql(u8, "error_code", field.snake_name) and std.mem.eql(u8, "i16", zig_type)) {
         zig_type = "ResponseError";
     }
 
     const nullable = if (nullable_versions.contains(version)) "?" else "";
-
-    var default_buffer: [128]u8 = undefined;
 
     const default = if (field.default) |value|
         switch (value) {
@@ -1196,9 +1205,9 @@ fn mapField(field: ProtocolField, version: usize, writer: *Io.Writer) !void {
                 if (std.mem.eql(u8, "null", s)) {
                     break :blk " = null";
                 }
-                break :blk try std.fmt.bufPrint(&default_buffer, " = {s}", .{s});
+                break :blk try std.fmt.bufPrint(&format_buffer, " = {s}", .{s});
             },
-            .integer => |i| try std.fmt.bufPrint(&default_buffer, " = {}", .{i}),
+            .integer => |i| try std.fmt.bufPrint(&format_buffer, " = {}", .{i}),
             else => {
                 std.log.err("Bad default {any}", .{value});
                 return error.UnsupportedType;
