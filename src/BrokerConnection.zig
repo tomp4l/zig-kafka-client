@@ -1,6 +1,7 @@
 const std = @import("std");
-const protocol = @import("protocol");
 const Io = std.Io;
+
+const protocol = @import("protocol");
 
 const Self = @This();
 
@@ -8,6 +9,7 @@ const VersionMap = std.AutoHashMapUnmanaged(i16, VersionRange);
 
 inflight_requests_mutex: std.Io.Mutex = .init,
 write_mutex: std.Io.Mutex = .init,
+connection_mutex: std.Io.Mutex = .init,
 
 // correlation ID to request mapping
 inflight_requests: std.AutoHashMapUnmanaged(u32, *InFlightRequest) = .empty,
@@ -28,6 +30,7 @@ client_software_version: []const u8 = "0.0.1",
 
 reader: *Io.Reader,
 writer: *Io.Writer,
+metadata_allocator: std.mem.Allocator,
 
 timeout: Io.Duration = .fromSeconds(30),
 
@@ -36,18 +39,25 @@ const VersionRange = struct {
     max: i16,
 };
 
-pub fn init(reader: *Io.Reader, writer: *Io.Writer) Self {
+pub fn init(
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    metadata_allocator: std.mem.Allocator,
+) Self {
     return .{
         .reader = reader,
         .writer = writer,
+        .metadata_allocator = metadata_allocator,
     };
 }
 
 pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]const u8) !void {
+    try self.connection_mutex.lock(io);
+    defer self.connection_mutex.unlock(io);
     if (self.read_future != null) return error.AlreadyConnected;
 
     self.client_id = client_id;
-    self.read_future = try io.concurrent(readResponses, .{ self, io, allocator });
+    self.read_future = try io.concurrent(readResponses, .{ self, io });
 
     const api_version_request: protocol.ApiVersionsRequestV4 = .{
         .client_software_name = self.client_software_name,
@@ -69,7 +79,7 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
         return error.VersionDiscoveryFailed;
     }
 
-    var valid_versions = try allocator.create(VersionMap);
+    var valid_versions = try self.metadata_allocator.create(VersionMap);
     valid_versions.* = .empty;
 
     errdefer {
@@ -80,7 +90,7 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
 
     for (versions.value.api_keys) |api_key| {
         try valid_versions.put(
-            allocator,
+            self.metadata_allocator,
             api_key.api_key,
             .{ .min = api_key.min_version, .max = api_key.max_version },
         );
@@ -89,12 +99,12 @@ pub fn connect(self: *Self, io: Io, allocator: std.mem.Allocator, client_id: ?[]
     self.valid_versions.store(valid_versions, .release);
 }
 
-pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+pub fn deinit(self: *Self, io: Io) void {
     if (self.read_future) |*f| f.cancel(io);
-    self.release(io, allocator);
+    self.release(io);
 }
 
-fn release(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+fn release(self: *Self, io: Io) void {
     if (self.references.fetchSub(1, .monotonic) > 1) {
         return;
     }
@@ -102,15 +112,15 @@ fn release(self: *Self, io: Io, allocator: std.mem.Allocator) void {
     self.inflight_requests_mutex.lockUncancelable(io);
     defer self.inflight_requests_mutex.unlock(io);
 
-    self.inflight_requests.deinit(allocator);
+    self.inflight_requests.deinit(self.metadata_allocator);
 
     self.write_mutex.lockUncancelable(io);
     defer self.write_mutex.unlock(io);
 
     if (self.valid_versions.load(.acquire)) |valid_versions| {
         self.valid_versions.store(null, .release);
-        valid_versions.deinit(allocator);
-        allocator.destroy(valid_versions);
+        valid_versions.deinit(self.metadata_allocator);
+        self.metadata_allocator.destroy(valid_versions);
     }
 
     self.read_error = null;
@@ -118,6 +128,7 @@ fn release(self: *Self, io: Io, allocator: std.mem.Allocator) void {
 
 const InFlightRequest = struct {
     request_state: std.atomic.Value(RequestState) = .init(.started),
+    response_alloctor: std.mem.Allocator,
     response: []const u8 = undefined,
     response_header_flexible: bool,
 };
@@ -206,7 +217,7 @@ fn makeRequestInternal(
     }
 
     _ = self.references.fetchAdd(1, .monotonic);
-    defer self.release(io, allocator);
+    defer self.release(io);
 
     if (validate_version) {
         if (self.valid_versions.load(.acquire)) |valid_versions| {
@@ -222,12 +233,15 @@ fn makeRequestInternal(
         }
     }
 
-    var in_flight: InFlightRequest = .{ .response_header_flexible = RequestType.is_flexible and RequestType.api_key != API_VERSION_KEY };
+    var in_flight: InFlightRequest = .{
+        .response_alloctor = allocator,
+        .response_header_flexible = RequestType.is_flexible and RequestType.api_key != API_VERSION_KEY,
+    };
     const correlation_id = self.getNextCorrelationId();
     {
         try self.inflight_requests_mutex.lock(io);
         defer self.inflight_requests_mutex.unlock(io);
-        try self.inflight_requests.put(allocator, correlation_id, &in_flight);
+        try self.inflight_requests.put(self.metadata_allocator, correlation_id, &in_flight);
     }
     // Ensure we always clean up if something goes wrong
     defer cleanOutstandingRequest(self, io, correlation_id);
@@ -291,15 +305,6 @@ fn makeRequestInternal(
 
     errdefer allocator.free(in_flight.response);
 
-    // if (std.log.logEnabled(.debug, .any)) {
-    //     std.log.debug("\n--- RAW RESPONSE HEX DUMP ---\nLength: {d} bytes\n", .{in_flight.response.len});
-    //     for (in_flight.response, 0..) |b, i| {
-    //         std.log.debug("{X:0>2} ", .{b});
-    //         if (i % 16 == 15) std.debug.print("\n", .{});
-    //     }
-    //     std.log.debug("\n-----------------------------\n\n", .{});
-    // }
-
     var value_arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer value_arena.deinit();
     const value = try ResponseType.deserialise(value_arena.allocator(), in_flight.response);
@@ -341,7 +346,7 @@ fn recordReadError(self: *Self, io: Io, err: anyerror, curr_request: ?*InFlightR
     self.inflight_requests.clearRetainingCapacity();
 }
 
-fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+fn readResponses(self: *Self, io: Io) void {
     while (true) {
 
         // read next message
@@ -363,7 +368,7 @@ fn readResponses(self: *Self, io: Io, allocator: std.mem.Allocator) void {
                 if (flexible != 0) return self.recordReadError(io, error.Unimplemented, r);
                 size -= 1;
             }
-
+            const allocator = r.response_alloctor;
             const response_body = allocator.alloc(u8, size) catch |err| return self.recordReadError(io, err, r);
             var finished = false;
             defer if (!finished) allocator.free(response_body);
@@ -419,14 +424,20 @@ test "fake request / response" {
         }
     };
 
-    const allocator = std.testing.allocator;
+    var metadata_allocator_instance: std.heap.DebugAllocator(.{}) = .init;
+    defer metadata_allocator_instance.deinitWithoutLeakChecks();
+    const metadata_allocator = metadata_allocator_instance.allocator();
+    var request_allocator_instance: std.heap.DebugAllocator(.{}) = .init;
+    defer request_allocator_instance.deinitWithoutLeakChecks();
 
-    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
-    defer connection.deinit(io, allocator);
+    const request_allocator = request_allocator_instance.allocator();
+
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer, metadata_allocator);
+    defer connection.deinit(io);
     connection.client_software_name = "";
     connection.client_software_version = "";
 
-    var connect_future = try io.concurrent(connect, .{ &connection, io, allocator, null });
+    var connect_future = try io.concurrent(connect, .{ &connection, io, request_allocator, null });
 
     const bytes = try output_pipe.reader.take(18);
     try std.testing.expectEqualSlices(u8, &.{
@@ -471,7 +482,7 @@ test "fake request / response" {
         }
     };
 
-    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
+    var future_response = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, request_allocator, fake_request });
 
     _ = try output_pipe.reader.peek(1);
 
@@ -530,8 +541,8 @@ test "it propogates errors" {
 
     const allocator = std.testing.allocator;
 
-    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
-    defer connection.deinit(io, allocator);
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer, allocator);
+    defer connection.deinit(io);
     connection.client_software_name = "";
     connection.client_software_version = "";
 
@@ -601,8 +612,8 @@ test "it times out" {
 
     const allocator = std.testing.allocator;
 
-    var connection: Self = .init(&input_pipe.reader, &output_writer.writer);
-    defer connection.deinit(io, allocator);
+    var connection: Self = .init(&input_pipe.reader, &output_writer.writer, allocator);
+    defer connection.deinit(io);
     connection.client_software_name = "";
     connection.client_software_version = "";
     connection.timeout = .fromNanoseconds(1);
@@ -649,8 +660,8 @@ test "concurrent requests" {
 
     const allocator = std.testing.allocator;
 
-    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer);
-    defer connection.deinit(io, allocator);
+    var connection: Self = .init(&input_pipe.reader, &output_pipe.writer, allocator);
+    defer connection.deinit(io);
     connection.timeout = .fromMilliseconds(100);
     connection.client_software_name = "";
     connection.client_software_version = "";
@@ -704,18 +715,18 @@ test "concurrent requests" {
 
     var future_response2 = try io.concurrent(Wrapper.makeRequest, .{ &connection, io, allocator, fake_request });
 
-    _ = try output_pipe.reader.peek(1);
+    _ = try output_pipe.reader.peek(36);
 
     try input_pipe.sendData(&.{
         0x00, 0x00, 0x00, 0x0a, // 10 bytes
-        0x00, 0x00, 0x00, 0x01, // correlation id 1
+        0x00, 0x00, 0x00, 0x02, // correlation id 2
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00,
     });
 
     try input_pipe.sendData(&.{
         0x00, 0x00, 0x00, 0x0a, // 10 bytes
-        0x00, 0x00, 0x00, 0x02, // correlation id 2
+        0x00, 0x00, 0x00, 0x01, // correlation id 1
         0x00, 0x00, 0x00, 0x00,
         0x00, 0x00,
     });
@@ -734,6 +745,9 @@ test "concurrent requests" {
         'h', 'e', 'l', 'l', 'o', // dummy payload
     }, try output_pipe.reader.take(19));
 
-    var response2 = try future_response2.await(io);
+    var response2 = future_response2.await(io) catch |err| {
+        std.debug.print("{any}\n", .{err});
+        return err;
+    };
     defer response2.deinit();
 }

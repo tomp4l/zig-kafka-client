@@ -166,10 +166,9 @@ pub fn build(b: *std.Build) void {
 
     const generate_protocol_output = generate_protocol_step.addOutputFileArg("protocol.zig");
 
-    var threaded = std.Io.Threaded.init(b.allocator, .{});
-    const io = threaded.io();
+    const io = b.graph.io;
     // Open and iterate the protocol dir at build time
-    var dir = std.Io.Dir.cwd().openDir(io, "protocol", .{ .iterate = true }) catch |err| {
+    var dir = b.build_root.handle.openDir(io, "protocol", .{ .iterate = true }) catch |err| {
         std.debug.panic("Failed to open protocol dir: {}", .{err});
     };
     defer dir.close(io);

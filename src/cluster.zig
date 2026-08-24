@@ -2,69 +2,11 @@ const std = @import("std");
 const Io = std.Io;
 const HostName = Io.net.HostName;
 
-const BrokerConnection = @import("BrokerConnection.zig");
 const protocol = @import("protocol");
 
-// todo config?
-const socket_read_buffer_size = 128 * 1024;
-const socket_write_buffer_size = 128 * 1024;
-
-const ConnectedNode = struct {
-    node_id: ?i32 = null,
-    broker_connection: BrokerConnection,
-    connection: Io.net.Stream,
-
-    socket_read_buffer: [socket_read_buffer_size]u8,
-    socket_write_buffer: [socket_write_buffer_size]u8,
-
-    socket_reader: Io.net.Stream.Reader,
-    socket_writer: Io.net.Stream.Writer,
-
-    ref_count: std.atomic.Value(usize) = .init(1),
-
-    fn init(io: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16) !*@This() {
-        const self = try allocator.create(@This());
-        errdefer allocator.destroy(self);
-        self.node_id = null;
-        self.ref_count = .init(1);
-        self.connection = try host_name.connect(io, port, .{
-            .mode = .stream,
-            .timeout = .none,
-        });
-        errdefer self.connection.close(io);
-
-        self.socket_reader = self.connection.reader(io, &self.socket_read_buffer);
-        self.socket_writer = self.connection.writer(io, &self.socket_write_buffer);
-
-        self.broker_connection = .init(&self.socket_reader.interface, &self.socket_writer.interface);
-        errdefer self.broker_connection.deinit(io, allocator);
-        // todo client id
-        try self.broker_connection.connect(io, allocator, null);
-
-        return self;
-    }
-
-    fn retain(self: *@This()) void {
-        _ = self.ref_count.fetchAdd(1, .monotonic);
-    }
-
-    fn release(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
-        if (self.ref_count.fetchSub(1, .monotonic) == 1) {
-            self.deinit(io, allocator);
-        }
-    }
-
-    fn makeRequest(self: *@This(), ResponseType: type, io: Io, allocator: std.mem.Allocator, request: anytype) !BrokerConnection.KafkaResponse(ResponseType) {
-        return self.broker_connection.makeRequest(ResponseType, io, allocator, request);
-    }
-
-    fn deinit(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
-        self.broker_connection.deinit(io, allocator);
-        self.connection.close(io);
-        self.* = undefined;
-        allocator.destroy(self);
-    }
-};
+const FakeConnection = @import("./testing/connection.zig").FakeConnection;
+const BrokerConnection = @import("BrokerConnection.zig");
+const ConnectedNode = @import("ConnectedNode.zig");
 
 const BrokerConfig = struct {
     host: []const u8,
@@ -98,52 +40,60 @@ const TopicMap = std.StringHashMapUnmanaged(TopicConfig);
 
 pub const Cluster = GenericCluster(ConnectedNode);
 
-const TopicIdAndLeader = struct {
+pub const TopicIdAndLeader = struct {
     leader_id: i32,
     topic_id: [16]u8,
+    topic_name: []const u8,
+    partition_index: i32,
 };
 
-fn GenericCluster(NodeType: type) type {
+pub const TopicNameAndPartition = struct {
+    topic_name: []const u8,
+    partition_index: i32,
+};
+
+pub fn GenericCluster(ConnectionType: type) type {
     return struct {
         const Self = @This();
 
         connection_mutex: Io.Mutex = .init,
-        connection_node_map: std.AutoHashMapUnmanaged(i32, *NodeType) = .empty,
-        connections: std.ArrayList(*NodeType) = .empty,
+        connection_node_map: std.AutoHashMapUnmanaged(i32, *ConnectionType) = .empty,
+        connections: std.ArrayList(*ConnectionType) = .empty,
         connection_last_used: usize = 0,
 
         // lazily populated on write
         topic_config_mutex: std.Io.Mutex = .init,
         topic_config: TopicMap = .empty,
+        cluster_allocator: std.mem.Allocator,
 
-        pub fn init() Self {
-            return .{};
+        pub fn init(metadata_allocator: std.mem.Allocator) Self {
+            return .{ .cluster_allocator = metadata_allocator };
         }
 
-        pub fn deinit(self: *Self, io: Io, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Self, io: Io) void {
             self.connection_mutex.lockUncancelable(io);
 
             for (self.connections.items) |conn| {
-                conn.release(io, allocator);
+                conn.release(io, self.cluster_allocator);
             }
 
-            self.connection_node_map.deinit(allocator);
-            self.connections.deinit(allocator);
+            self.connection_node_map.deinit(self.cluster_allocator);
+            self.connections.deinit(self.cluster_allocator);
 
             self.topic_config_mutex.lockUncancelable(io);
 
             var topic_config_it = self.topic_config.iterator();
             while (topic_config_it.next()) |kv| {
-                allocator.free(kv.key_ptr.*);
-                kv.value_ptr.deinit(allocator);
+                self.cluster_allocator.free(kv.key_ptr.*);
+                kv.value_ptr.deinit(self.cluster_allocator);
             }
 
-            self.topic_config.deinit(allocator);
+            self.topic_config.deinit(self.cluster_allocator);
 
             self.* = undefined;
         }
 
-        fn nextUnusedConnecton(self: *Self, io: Io) !*NodeType {
+        fn nextUnusedConnecton(self: *Self, io: Io) !*ConnectionType {
             try self.connection_mutex.lock(io);
             defer self.connection_mutex.unlock(io);
             if (self.connections.items.len == 0) return error.NotBootstrapped;
@@ -168,7 +118,7 @@ fn GenericCluster(NodeType: type) type {
             return connection.makeRequest(ResponseType, io, allocator, request);
         }
 
-        fn connectionForNode(self: *@This(), io: Io, node_id: i32) !*NodeType {
+        fn connectionForNode(self: *@This(), io: Io, node_id: i32) !*ConnectionType {
             try self.connection_mutex.lock(io);
             defer self.connection_mutex.unlock(io);
             var connection = self.connection_node_map.get(node_id) orelse return error.MissingNode;
@@ -185,37 +135,67 @@ fn GenericCluster(NodeType: type) type {
             node_id: i32,
             request: anytype,
         ) !BrokerConnection.KafkaResponse(ResponseType) {
-            var connection: *NodeType = try self.connectionForNode(io, node_id);
+            var connection: *ConnectionType = try self.connectionForNode(io, node_id);
             defer connection.release(io, allocator);
 
             return connection.makeRequest(ResponseType, io, allocator, request);
         }
 
-        pub fn leaderForTopicPartition(
+        pub fn leadersForTopicsAndPartitions(
             self: *@This(),
             io: Io,
-            allocator: std.mem.Allocator,
-            topic_name: []const u8,
-            partition_index: i32,
-        ) !TopicIdAndLeader {
+            request_allocator: std.mem.Allocator,
+            topics: []const TopicNameAndPartition,
+            output: []TopicIdAndLeader,
+        ) !void {
+            std.debug.assert(topics.len == output.len);
+
+            var has_all_topics = true;
             {
                 try self.topic_config_mutex.lock(io);
                 defer self.topic_config_mutex.unlock(io);
-                if (self.topic_config.get(topic_name)) |config| {
-                    if (config.partitions.get(partition_index)) |partition| {
-                        return .{
-                            .leader_id = partition.leader_id,
-                            .topic_id = config.topic_id,
-                        };
+                for (topics, output) |topic, *out| {
+                    if (self.topic_config.get(topic.topic_name)) |topic_config| {
+                        if (topic_config.partitions.get(topic.partition_index)) |partition| {
+                            out.* = .{
+                                .leader_id = partition.leader_id,
+                                .topic_id = topic_config.topic_id,
+                                .topic_name = topic.topic_name,
+                                .partition_index = topic.partition_index,
+                            };
+                        } else {
+                            has_all_topics = false;
+                            break;
+                        }
+                    } else {
+                        has_all_topics = false;
+                        break;
                     }
                 }
             }
 
-            const metadata_request: protocol.MetadataRequestV13 = .{
-                .topics = &.{.{
+            if (has_all_topics) {
+                return;
+            }
+
+            var unique_topics: std.StringHashMapUnmanaged(void) = .empty;
+            defer unique_topics.deinit(request_allocator);
+            for (topics) |topic| {
+                try unique_topics.put(request_allocator, topic.topic_name, {});
+            }
+
+            var topics_request: std.ArrayList(protocol.MetadataRequestV13.MetadataRequestTopic) = .empty;
+            defer topics_request.deinit(request_allocator);
+            var unique_topic_iter = unique_topics.keyIterator();
+            while (unique_topic_iter.next()) |topic_name| {
+                try topics_request.append(request_allocator, .{
                     .topic_id = @splat(0),
-                    .name = topic_name,
-                }},
+                    .name = topic_name.*,
+                });
+            }
+
+            const metadata_request: protocol.MetadataRequestV13 = .{
+                .topics = topics_request.items,
                 .allow_auto_topic_creation = false, // could be configured
                 .include_topic_authorized_operations = false, // could use this to respect ACLs later
             };
@@ -223,7 +203,7 @@ fn GenericCluster(NodeType: type) type {
             var metadata_response = try self.makeRequestAny(
                 protocol.MetadataResponseV13,
                 io,
-                allocator,
+                request_allocator,
                 metadata_request,
             );
             defer metadata_response.deinit();
@@ -235,10 +215,10 @@ fn GenericCluster(NodeType: type) type {
 
             for (response_value.topics) |topic| {
                 if (topic.name) |name| {
-                    const config = try self.topic_config.getOrPut(allocator, name);
+                    const config = try self.topic_config.getOrPut(self.cluster_allocator, name);
 
                     if (!config.found_existing) {
-                        config.key_ptr.* = try allocator.dupe(u8, name);
+                        config.key_ptr.* = try self.cluster_allocator.dupe(u8, name);
                         config.value_ptr.* = .{
                             .topic_id = topic.topic_id,
                         };
@@ -248,29 +228,21 @@ fn GenericCluster(NodeType: type) type {
 
                     const topic_config: *TopicConfig = config.value_ptr;
 
-                    const is_topic = std.mem.eql(u8, name, topic_name);
                     if (topic.error_code != .NONE) {
                         std.log.warn("Got topic error {s}: {any}", .{ name, topic.error_code });
 
-                        if (is_topic) {
-                            return error.TopicError;
-                        } else {
-                            continue;
-                        }
+                        return error.TopicError;
                     }
 
                     for (topic.partitions) |partition| {
                         if (partition.error_code != .NONE) {
                             std.log.warn("Got partition error {s}-{}: {any}", .{ name, partition.partition_index, partition.error_code });
-                            if (is_topic and partition.partition_index == partition_index) {
-                                return error.PartitionError;
-                            } else {
-                                continue;
-                            }
+
+                            return error.PartitionError;
                         }
 
                         try topic_config.partitions.put(
-                            allocator,
+                            self.cluster_allocator,
                             partition.partition_index,
                             .{ .leader_id = partition.leader_id },
                         );
@@ -278,15 +250,38 @@ fn GenericCluster(NodeType: type) type {
                 }
             }
 
-            if (self.topic_config.get(topic_name)) |config| {
-                if (config.partitions.get(partition_index)) |partition| {
-                    return .{
-                        .leader_id = partition.leader_id,
-                        .topic_id = config.topic_id,
-                    };
+            for (topics, output) |topic, *out| {
+                if (self.topic_config.get(topic.topic_name)) |topic_config| {
+                    if (topic_config.partitions.get(topic.partition_index)) |partition| {
+                        out.* = .{
+                            .leader_id = partition.leader_id,
+                            .topic_id = topic_config.topic_id,
+                            .topic_name = topic.topic_name,
+                            .partition_index = topic.partition_index,
+                        };
+                    } else {
+                        return error.MissingTopicPartition;
+                    }
+                } else {
+                    return error.MissingTopicPartition;
                 }
             }
-            return error.NotFound;
+        }
+
+        pub fn leaderForTopicPartition(
+            self: *@This(),
+            io: Io,
+            allocator: std.mem.Allocator,
+            topic_name: []const u8,
+            partition_index: i32,
+        ) !TopicIdAndLeader {
+            var output: [1]TopicIdAndLeader = undefined;
+            try self.leadersForTopicsAndPartitions(io, allocator, &.{.{
+                .topic_name = topic_name,
+                .partition_index = partition_index,
+            }}, &output);
+
+            return output[0];
         }
 
         pub fn bootstrap(self: *Self, io: Io, allocator: std.mem.Allocator, config: BootstrapConfig) !void {
@@ -295,10 +290,10 @@ fn GenericCluster(NodeType: type) type {
             if (self.connection_node_map.count() > 0) return error.AlreadyBootstrapped;
             errdefer {
                 for (self.connections.items) |conn| {
-                    conn.release(io, allocator);
+                    conn.release(io, self.cluster_allocator);
                 }
-                self.connections.clearAndFree(allocator);
-                self.connection_node_map.clearAndFree(allocator);
+                self.connections.clearAndFree(self.cluster_allocator);
+                self.connection_node_map.clearAndFree(self.cluster_allocator);
             }
 
             // if we provide more we can try them first here
@@ -307,8 +302,8 @@ fn GenericCluster(NodeType: type) type {
 
             const host_name = try HostName.init(last_server.host);
 
-            var connected_node = try NodeType.init(io, allocator, host_name, last_server.port);
-            errdefer connected_node.release(io, allocator);
+            var connected_node = try ConnectionType.init(io, self.cluster_allocator, host_name, last_server.port);
+            errdefer connected_node.release(io, self.cluster_allocator);
 
             const req = protocol.MetadataRequestV13{
                 .topics = &.{},
@@ -330,8 +325,8 @@ fn GenericCluster(NodeType: type) type {
                     @as(i32, @intCast(last_server.port)) == broker.port)
                 {
                     reused_connection = true;
-                    try self.connection_node_map.put(allocator, broker.node_id, connected_node);
-                    try self.connections.append(allocator, connected_node);
+                    try self.connection_node_map.put(self.cluster_allocator, broker.node_id, connected_node);
+                    try self.connections.append(self.cluster_allocator, connected_node);
                 } else {
                     const node_host_name = try HostName.init(broker.host);
 
@@ -339,74 +334,15 @@ fn GenericCluster(NodeType: type) type {
                         return error.InvalidPort;
                     }
 
-                    var new_connected_node = try NodeType.init(io, allocator, node_host_name, @intCast(broker.port));
-                    errdefer new_connected_node.release(io, allocator);
-                    try self.connection_node_map.put(allocator, broker.node_id, new_connected_node);
-                    try self.connections.append(allocator, new_connected_node);
+                    var new_connected_node = try ConnectionType.init(io, self.cluster_allocator, node_host_name, @intCast(broker.port));
+                    errdefer new_connected_node.release(io, self.cluster_allocator);
+                    try self.connection_node_map.put(self.cluster_allocator, broker.node_id, new_connected_node);
+                    try self.connections.append(self.cluster_allocator, new_connected_node);
                 }
             }
 
             if (!reused_connection) {
-                connected_node.release(io, allocator);
-            }
-        }
-    };
-}
-
-fn FakeConnection(mockFn: anytype) type {
-    return struct {
-        var global_id: std.atomic.Value(usize) = .init(0);
-
-        host_name: []const u8,
-        port: u16,
-        id: usize,
-        call_count: std.atomic.Value(usize) = .init(0),
-
-        ref_count: std.atomic.Value(usize) = .init(1),
-
-        fn init(io_: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16) !*@This() {
-            _ = io_;
-
-            const self = try allocator.create(@This());
-
-            self.* = .{
-                .host_name = try allocator.dupe(u8, host_name.bytes),
-                .port = port,
-                .id = global_id.fetchAdd(1, .monotonic),
-            };
-
-            return self;
-        }
-
-        fn makeRequest(
-            self: *@This(),
-            ResponseType: type,
-            io: Io,
-            allocator: std.mem.Allocator,
-            request: anytype,
-        ) !BrokerConnection.KafkaResponse(ResponseType) {
-            _ = io;
-
-            _ = self.call_count.fetchAdd(1, .monotonic);
-
-            var arena = std.heap.ArenaAllocator.init(allocator);
-
-            const response_raw = try mockFn.mock(arena.allocator(), request);
-            const response_cast: *ResponseType = @ptrCast(@alignCast(response_raw));
-
-            return BrokerConnection.KafkaResponse(ResponseType){ .arena = arena, .raw_buffer = &.{}, .value = response_cast.* };
-        }
-
-        fn retain(self: *@This()) void {
-            _ = self.ref_count.fetchAdd(1, .monotonic);
-        }
-
-        fn release(self: *@This(), io: Io, allocator: std.mem.Allocator) void {
-            _ = io;
-
-            if (self.ref_count.fetchSub(1, .monotonic) == 1) {
-                allocator.free(self.host_name);
-                allocator.destroy(self);
+                connected_node.release(io, self.cluster_allocator);
             }
         }
     };
@@ -414,7 +350,7 @@ fn FakeConnection(mockFn: anytype) type {
 
 test "cluster bootstrap and partition" {
     const TestCluster = GenericCluster(FakeConnection(struct {
-        fn mock(arena: std.mem.Allocator, request: anytype) !*anyopaque {
+        pub fn mock(arena: std.mem.Allocator, request: anytype) !*anyopaque {
             if (@TypeOf(request) == protocol.MetadataRequestV13) {
                 const request_typed: protocol.MetadataRequestV13 = request;
 
@@ -470,8 +406,10 @@ test "cluster bootstrap and partition" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
 
-    var cluster: TestCluster = .init();
-    defer cluster.deinit(io, allocator);
+    var cluster_allocator_instance: std.heap.DebugAllocator(.{}) = .init;
+    const cluster_allocator = cluster_allocator_instance.allocator();
+    var cluster: TestCluster = .init(cluster_allocator);
+    defer cluster.deinit(io);
 
     try cluster.bootstrap(io, allocator, .single("localhost", 1234));
 
