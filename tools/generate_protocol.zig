@@ -981,47 +981,72 @@ fn createSerialiseField(
     is_flexible: bool,
     writer: *Io.Writer,
 ) !void {
-    _ = arena;
-
     const is_nullable = if (field.nullableVersions) |n|
         (try VersionRange.parse(n)).contains(version)
     else
         false;
 
     const kafka_type = field.type;
+    const identifier = try std.fmt.allocPrint(arena, "self.{s}", .{field.snake_name});
+    defer arena.free(identifier);
+
+    return createSerialiseIdentifier(
+        identifier,
+        kafka_type,
+        is_nullable,
+
+        is_flexible,
+        writer,
+    );
+}
+
+fn createSerialiseIdentifier(
+    identifier: []const u8,
+    kafka_type: []const u8,
+    is_nullable: bool,
+    is_flexible: bool,
+    writer: *Io.Writer,
+) error{WriteFailed}!void {
     if (std.mem.eql(u8, kafka_type, "int8"))
-        return createSerialiseInt(i8, field, writer);
+        return createSerialiseInt(i8, identifier, writer);
     if (std.mem.eql(u8, kafka_type, "int16"))
-        return createSerialiseInt(i16, field, writer);
+        return createSerialiseInt(i16, identifier, writer);
     if (std.mem.eql(u8, kafka_type, "int32"))
-        return createSerialiseInt(i32, field, writer);
+        return createSerialiseInt(i32, identifier, writer);
     if (std.mem.eql(u8, kafka_type, "int64"))
-        return createSerialiseInt(i64, field, writer);
+        return createSerialiseInt(i64, identifier, writer);
     if (std.mem.eql(u8, kafka_type, "bool"))
-        return createSerialiseBool(field, writer);
+        return createSerialiseBool(identifier, writer);
     if (std.mem.eql(u8, kafka_type, "string"))
-        return createSerialiseBytes(field, is_nullable, is_flexible, writer);
+        return createSerialiseBytes(identifier, kafka_type, is_nullable, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "bytes"))
-        return createSerialiseBytes(field, is_nullable, is_flexible, writer);
+        return createSerialiseBytes(identifier, kafka_type, is_nullable, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "records"))
-        return createSerialiseBytes(field, is_nullable, is_flexible, writer);
+        return createSerialiseBytes(identifier, kafka_type, is_nullable, is_flexible, writer);
     if (std.mem.eql(u8, kafka_type, "uuid"))
-        return try createSerialiseUuid(field, writer);
+        return try createSerialiseUuid(identifier, writer);
     if (std.mem.eql(u8, kafka_type, "float64")) @panic("float64");
 
-    try createSerialiseArray(field, is_nullable, is_flexible, writer);
+    if (kafka_type[0] == '[' and kafka_type[1] == ']') {
+        try createSerialiseArray(identifier, kafka_type[2..], is_nullable, is_flexible, writer);
+    } else {
+        try writer.print(
+            \\ try {s}.serialise(writer);
+        , .{identifier});
+    }
 }
 
 fn createSerialiseArray(
-    field: ProtocolField,
+    identifier: []const u8,
+    sub_type: []const u8,
     is_nullable: bool,
     is_flexible: bool,
     writer: *Io.Writer,
 ) !void {
     if (is_nullable) {
-        try writer.print("if (self.{s}) |slice| {{", .{field.snake_name});
+        try writer.print("if ({s}) |slice| {{", .{identifier});
     } else {
-        try writer.print("{{ const slice = self.{s};", .{field.snake_name});
+        try writer.print("{{ const slice = {s};", .{identifier});
     }
 
     if (is_flexible) {
@@ -1036,7 +1061,11 @@ fn createSerialiseArray(
 
     try writer.writeAll(
         \\for (slice) |value| {
-        \\      try value.serialise(writer);
+    );
+
+    try createSerialiseIdentifier("value", sub_type, false, is_flexible, writer);
+
+    try writer.writeAll(
         \\ }
     );
 
@@ -1062,60 +1091,61 @@ fn createSerialiseArray(
 
 fn createSerialiseInt(
     T: type,
-    field: ProtocolField,
+    identifier: []const u8,
     writer: *Io.Writer,
 ) !void {
     try writer.print(
         \\ {{
         \\   var buf: [{}]u8 = undefined;
-        \\   std.mem.writeInt({}, &buf, self.{s} , .big);
+        \\   std.mem.writeInt({}, &buf, {s} , .big);
         \\   try writer.writeAll(&buf);
         \\ }}
-    , .{ @sizeOf(T), T, field.snake_name });
+    , .{ @sizeOf(T), T, identifier });
 }
 
 fn createSerialiseUuid(
-    field: ProtocolField,
+    identifier: []const u8,
     writer: *Io.Writer,
 ) !void {
     try writer.print(
         \\ {{
-        \\   try writer.writeAll(&self.{s});
+        \\   try writer.writeAll(&{s});
         \\ }}
-    , .{field.snake_name});
+    , .{identifier});
 }
 
 fn createSerialiseBool(
-    field: ProtocolField,
+    identifier: []const u8,
     writer: *Io.Writer,
 ) !void {
     try writer.print(
         \\ {{
-        \\   try writer.writeByte(@intFromBool(self.{s}));
+        \\   try writer.writeByte(@intFromBool({s}));
         \\ }}
-    , .{field.snake_name});
+    , .{identifier});
 }
 
 fn createSerialiseBytes(
-    field: ProtocolField,
+    identifier: []const u8,
+    kafka_type: []const u8,
     is_nullable: bool,
     is_flexible: bool,
     writer: *Io.Writer,
 ) !void {
     if (is_nullable) {
-        try writer.print("if(self.{s}) |field| {{", .{field.snake_name});
+        try writer.print("if({s}) |field| {{", .{identifier});
     } else {
         try writer.print(
             \\{{
-            \\   const field = self.{s};
-        , .{field.snake_name});
+            \\   const field = {s};
+        , .{identifier});
     }
 
     if (is_flexible) {
         try writer.writeAll("try writeUnsignedVarInt(writer, field.len + 1);");
     } else {
         // Legacy needs to differentiate between string vs bytes/records
-        if (std.mem.eql(u8, field.type, "string")) {
+        if (std.mem.eql(u8, kafka_type, "string")) {
             try writer.writeAll("try writer.writeInt(i16, @intCast(field.len), .big);");
         } else {
             // "bytes" and "records"
@@ -1132,7 +1162,7 @@ fn createSerialiseBytes(
             try writer.writeAll("try writeUnsignedVarInt(writer, 0);");
         } else {
             // Legacy needs to differentiate between string vs bytes/records
-            if (std.mem.eql(u8, field.type, "string")) {
+            if (std.mem.eql(u8, kafka_type, "string")) {
                 try writer.writeAll("try writer.writeInt(i16, -1, .big);");
             } else {
                 // "bytes" and "records"

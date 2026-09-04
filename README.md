@@ -12,7 +12,15 @@ A native Kafka client built from scratch in Zig 0.16. This project builds on `st
 
 ## Next
 
-- Basic consumer interface
+- Basic consumer interface, messages to implement listed below:
+  - FindCoordinator (API Key 10)
+  - JoinGroup (API Key 11)
+  - SyncGroup (API Key 14)
+  - OffsetFetch (API Key 9)
+  - Fetch (API Key 1)
+  - Heartbeat (API Key 12)
+  - OffsetCommit (API Key 8)
+  - LeaveGroup (API Key 13)
 - Tighten up existing functionality
 
 _This project is licensed under the MIT License. Certain files imported from Apache Kafka are licensed under the Apache License 2.0. See the LICENSE-APACHE and NOTICE files for details._
