@@ -32,7 +32,7 @@ reader: *Io.Reader,
 writer: *Io.Writer,
 metadata_allocator: std.mem.Allocator,
 
-timeout: Io.Duration = .fromSeconds(30),
+timeout: Io.Duration = .fromSeconds(300),
 
 const VersionRange = struct {
     min: i16,
@@ -202,7 +202,16 @@ fn makeRequestInternal(
     allocator: std.mem.Allocator,
     request: anytype,
     comptime validate_version: bool,
-) !KafkaResponse(ResponseType) {
+) error{
+    Timeout,
+    WriteFailed,
+    ConcurrencyUnavailable,
+    Canceled,
+    OutOfMemory,
+    ConnectionClosed,
+    DeserialisationFailed,
+    UnsupportedVersion,
+}!KafkaResponse(ResponseType) {
     const RequestType = @TypeOf(request);
     {
         try self.write_mutex.lock(io);
@@ -307,7 +316,11 @@ fn makeRequestInternal(
 
     var value_arena: std.heap.ArenaAllocator = .init(allocator);
     errdefer value_arena.deinit();
-    const value = try ResponseType.deserialise(value_arena.allocator(), in_flight.response);
+    const value = ResponseType.deserialise(value_arena.allocator(), in_flight.response) catch |err|
+        {
+            self.read_error = err;
+            return error.DeserialisationFailed;
+        };
     return .{
         .arena = value_arena,
         .raw_buffer = in_flight.response,

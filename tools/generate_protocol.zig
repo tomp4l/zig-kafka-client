@@ -130,6 +130,8 @@ const ProtocolJson = struct {
     flexibleVersions: []const u8,
     latestVersionUnstable: bool = false,
     fields: []ProtocolField,
+    // // This is to introduce v3 headers (KIP-1313), ignore / assume flexible v1/v2 split for now.
+    headerVersions: std.json.Value = .null,
 
     const VersionsIterator = struct {
         next_version: usize,
@@ -956,7 +958,8 @@ fn createSerialiseFields(
     var has_field = false;
     for (fields) |field| {
         const field_versions = try VersionRange.parse(field.versions);
-        if (field_versions.contains(version)) {
+        const tagged_versions = if (field.taggedVersions) |v| try VersionRange.parse(v) else .none;
+        if (field_versions.contains(version) and !tagged_versions.contains(version)) {
             has_field = true;
             try createSerialiseField(arena, field, version, is_flexible, writer);
         }
@@ -1235,7 +1238,12 @@ fn mapField(field: ProtocolField, version: usize, writer: *Io.Writer) !void {
                 if (std.mem.eql(u8, "null", s)) {
                     break :blk " = null";
                 }
-                break :blk try std.fmt.bufPrint(&format_buffer, " = {s}", .{s});
+                break :blk if (std.mem.eql(u8, "ResponseError", zig_type))
+                    try std.fmt.bufPrint(&format_buffer, " = @enumFromInt({s})", .{s})
+                else if (std.mem.eql(u8, "string", field.type))
+                    try std.fmt.bufPrint(&format_buffer, " = \"{s}\"", .{s})
+                else
+                    try std.fmt.bufPrint(&format_buffer, " = {s}", .{s});
             },
             .integer => |i| try std.fmt.bufPrint(&format_buffer, " = {}", .{i}),
             else => {

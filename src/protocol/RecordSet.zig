@@ -1,9 +1,10 @@
 const std = @import("std");
+const Io = std.Io;
+const Crc = std.hash.crc.Crc32Iscsi;
 
 const protocol = @import("protocol");
 
-const Io = std.Io;
-const Crc = std.hash.crc.Crc32Iscsi;
+const Self = @This();
 
 pub const Compression = enum(u3) {
     none = 0,
@@ -57,6 +58,7 @@ pub const Attributes = packed struct {
 // recordsCount: int32
 // records: [Record]
 
+base_offset: i64,
 partition_leader_epoch: i32,
 attributes: Attributes,
 last_offset_delta: i32,
@@ -75,6 +77,37 @@ fn writeVarLengthBytes(writer: *Io.Writer, maybe_value: ?[]const u8) !void {
     } else {
         try writer.writeByte(1); // -1
     }
+}
+
+pub fn readUnsignedVarInt(reader: *Io.Reader) !usize {
+    var value: usize = 0;
+    var shift: u6 = 0;
+
+    while (reader.takeByte() catch null) |byte| {
+        value |= @as(usize, byte & 0x7F) << shift;
+
+        if ((byte & 0x80) == 0) {
+            return value;
+        }
+
+        if (shift >= 63) return error.VarIntTooBig;
+        shift += 7;
+    }
+
+    return error.TooShort;
+}
+
+fn readVarLengthBytes(allocator: std.mem.Allocator, reader: *Io.Reader) !?[]const u8 {
+    const length = zigZagDecode(@intCast(try readUnsignedVarInt(reader)));
+
+    if (length == -1) {
+        return null;
+    }
+    if (length < 0) {
+        return error.InvalidLength;
+    }
+
+    return try reader.readAlloc(allocator, @intCast(length));
 }
 
 // length: varint
@@ -111,6 +144,64 @@ pub const Record = struct {
             try header.serialise(writer);
         }
     }
+
+    // decodes including skipping the length!
+    fn deserialise(allocator: std.mem.Allocator, reader: *Io.Reader) !Record {
+        const record_len: i32 = @intCast(zigZagDecode(@intCast(try readUnsignedVarInt(reader))));
+        _ = record_len;
+
+        const attributes = try reader.takeByte();
+        const timestamp_delta = zigZagDecode(@intCast(try readUnsignedVarInt(reader)));
+        const offset_delta: i32 = @intCast(zigZagDecode(@intCast(try readUnsignedVarInt(reader))));
+        const key = try readVarLengthBytes(allocator, reader);
+        errdefer if (key) |k| allocator.free(k);
+        const value = try readVarLengthBytes(allocator, reader);
+        errdefer if (value) |v| allocator.free(v);
+
+        const header_len: i32 = @intCast(zigZagDecode(@intCast(try readUnsignedVarInt(reader))));
+        if (header_len < 0) return error.InvalidHeaderLength;
+        var headers: std.ArrayList(Header) = try .initCapacity(allocator, @intCast(header_len));
+        errdefer {
+            for (headers.items) |h| {
+                allocator.free(h.header_key);
+                if (h.value) |v| allocator.free(v);
+            }
+            headers.deinit(allocator);
+        }
+
+        for (0..@intCast(header_len)) |i| {
+            _ = i;
+
+            const header_key = try readVarLengthBytes(allocator, reader);
+            errdefer if (header_key) |k| allocator.free(k);
+            const header_value = try readVarLengthBytes(allocator, reader);
+            errdefer if (header_value) |v| allocator.free(v);
+
+            try headers.appendBounded(.{
+                .header_key = header_key orelse return error.NullHeaderKey,
+                .value = header_value,
+            });
+        }
+
+        return .{
+            .attributes = attributes,
+            .timestamp_delta = timestamp_delta,
+            .offset_delta = offset_delta,
+            .key = key,
+            .value = value,
+            .headers = try headers.toOwnedSlice(allocator),
+        };
+    }
+
+    fn deinit(self: Record, allocator: std.mem.Allocator) void {
+        if (self.key) |k| allocator.free(k);
+        if (self.value) |k| allocator.free(k);
+        for (self.headers) |h| {
+            allocator.free(h.header_key);
+            if (h.value) |v| allocator.free(v);
+        }
+        allocator.free(self.headers);
+    }
 };
 
 // headerKeyLength: varint
@@ -132,6 +223,10 @@ fn zigZagEncode(val: i64) u64 {
     return @bitCast((val << 1) ^ (val >> 63));
 }
 
+fn zigZagDecode(val: u64) i64 {
+    return @bitCast((val >> 1) ^ (~(val & 1) +% 1));
+}
+
 const PRE_LENGTH_OFFSET = 8;
 const LENGTH_OFFSET = 12;
 const PRE_CRC_HEADER_OFFSET = (64 + 32 + 32 + 8) / 8;
@@ -148,7 +243,7 @@ pub fn serialise(self: *const @This(), allocator: std.mem.Allocator) ![]const u8
     defer allocating.deinit();
     var writer = &allocating.writer;
 
-    try writer.writeInt(i64, 0, .big); // base offset
+    try writer.writeInt(i64, self.base_offset, .big); // base offset
     try writer.writeInt(i32, 0, .big); // placeholder size
     try writer.writeInt(i32, self.partition_leader_epoch, .big);
     try writer.writeInt(i8, MAGIC_BYTE, .big);
@@ -182,6 +277,77 @@ pub fn serialise(self: *const @This(), allocator: std.mem.Allocator) ![]const u8
     return result;
 }
 
+pub fn deserialise(allocator: std.mem.Allocator, bytes: []const u8, consumed: *usize) !Self {
+    var reader = std.Io.Reader.fixed(bytes);
+    var self: Self = undefined;
+
+    self.base_offset = try reader.takeInt(i64, .big);
+    const message_size = try reader.takeInt(i32, .big);
+    consumed.* = LENGTH_OFFSET + @as(usize, @intCast(message_size));
+    self.partition_leader_epoch = try reader.takeInt(i32, .big);
+
+    if (try reader.takeInt(i8, .big) != MAGIC_BYTE) return error.InvalidMagic;
+    const crc = try reader.takeInt(u32, .big);
+    _ = crc; // assume correct for now
+    self.attributes = Attributes.fromU16(try reader.takeInt(u16, .big));
+    self.last_offset_delta = try reader.takeInt(i32, .big);
+    self.base_timestamp = try reader.takeInt(i64, .big);
+    self.max_timestamp = try reader.takeInt(i64, .big);
+    self.producer_id = try reader.takeInt(i64, .big);
+    self.producer_epoch = try reader.takeInt(i16, .big);
+    self.base_sequence = try reader.takeInt(i32, .big);
+
+    const records_len = try reader.takeInt(i32, .big);
+
+    var records: std.ArrayList(Record) = try .initCapacity(allocator, @intCast(records_len));
+    errdefer {
+        for (records.items) |r| {
+            r.deinit(allocator);
+        }
+        records.deinit(allocator);
+    }
+
+    for (0..@intCast(records_len)) |i| {
+        _ = i;
+
+        const record = try Record.deserialise(allocator, &reader);
+        errdefer record.deinit(allocator);
+        try records.appendBounded(record);
+    }
+
+    self.records = try records.toOwnedSlice(allocator);
+    return self;
+}
+
+pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+    for (self.records) |record| {
+        record.deinit(allocator);
+    }
+    allocator.free(self.records);
+}
+
+pub fn deserialiseAll(allocator: std.mem.Allocator, bytes: []const u8) ![]const Self {
+    var records: std.ArrayList(Self) = .empty;
+    errdefer {
+        for (records.items) |*r| {
+            r.deinit(allocator);
+        }
+        records.deinit(allocator);
+    }
+
+    var offset: usize = 0;
+
+    while (offset < bytes.len) {
+        var consumed: usize = undefined;
+        var record = try deserialise(allocator, bytes[offset..], &consumed);
+        errdefer record.deinit(allocator);
+        offset += consumed;
+        try records.append(allocator, record);
+    }
+
+    return try records.toOwnedSlice(allocator);
+}
+
 test "Attributes" {
     try std.testing.expectEqual(16, @bitSizeOf(Attributes));
 }
@@ -194,8 +360,17 @@ test zigZagEncode {
     try std.testing.expectEqual(4, zigZagEncode(2));
 }
 
+test zigZagDecode {
+    try std.testing.expectEqual(0, zigZagDecode(0));
+    try std.testing.expectEqual(-1, zigZagDecode(1));
+    try std.testing.expectEqual(1, zigZagDecode(2));
+    try std.testing.expectEqual(-2, zigZagDecode(3));
+    try std.testing.expectEqual(2, zigZagDecode(4));
+}
+
 test "serialise" {
     const set: @This() = .{
+        .base_offset = 0,
         .partition_leader_epoch = 1,
         .attributes = .{},
         .last_offset_delta = 2,
@@ -253,4 +428,21 @@ test "serialise" {
     };
 
     try std.testing.expectEqualSlices(u8, expected_bytes, bytes);
+}
+
+test "deserialise" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const bytes_hex = "0000000000000000000000420000000002eae98244000000000000000001a0a4b7f0d4000001a0a4b7f0d4ffffffffffffffffffffffffffff00000001200000000a68656c6c6f0a776f726c640000000000000000010000004200000000026ec12411000000000000000001a0a4b99a21000001a0a4b99a21ffffffffffffffffffffffffffff00000001200000000a68656c6c6f0a776f726c640000000000000000020000004200000000024696f7af000000000000000001a0a4bdc3b6000001a0a4bdc3b6ffffffffffffffffffffffffffff00000001200000000a68656c6c6f0a776f726c64000000000000000003000000420000000002ea75161a000000000000000001a0a4c0528d000001a0a4c0528dffffffffffffffffffffffffffff00000001200000000a68656c6c6f0a776f726c640000000000000000040000004200000000029467593c000000000000000001a0a4c0f75a000001a0a4c0f75affffffffffffffffffffffffffff00000001200000000a68656c6c6f0a776f726c6400";
+    var bytes_buffer: [bytes_hex.len / 2]u8 = undefined;
+    const bytes = try std.fmt.hexToBytes(&bytes_buffer, bytes_hex);
+
+    var first_message_size: usize = undefined;
+    const first_record = try deserialise(allocator, bytes, &first_message_size);
+
+    try std.testing.expectEqual(first_record.partition_leader_epoch, 0);
+
+    try std.testing.expectEqual(5, (try deserialiseAll(allocator, bytes)).len);
 }

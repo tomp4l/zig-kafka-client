@@ -37,7 +37,7 @@ pub fn init(io: Io, allocator: std.mem.Allocator, host_name: HostName, port: u16
     self.broker_connection = .init(&self.socket_reader.interface, &self.socket_writer.interface, allocator);
     errdefer self.broker_connection.deinit(io);
     // todo client id
-    try self.broker_connection.connect(io, allocator, null);
+    try self.broker_connection.connect(io, allocator, "zig_client");
 
     return self;
 }
@@ -60,11 +60,8 @@ pub fn makeRequest(self: *@This(), ResponseType: type, io: Io, allocator: std.me
         error.Canceled => return err,
         error.OutOfMemory => return err,
         error.ConnectionClosed => return self.socket_reader.err orelse (self.broker_connection.read_error orelse err),
-        // should probably do something to bundle these up as serde errors
-        error.TooShort => return err,
         error.UnsupportedVersion => return err,
-        error.VarIntTooBig => return err,
-        error.NonNullableField => return err,
+        error.DeserialisationFailed => return self.broker_connection.read_error orelse err,
     };
 }
 

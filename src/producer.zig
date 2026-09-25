@@ -223,6 +223,7 @@ fn GenericProducer(ConnectionType: type) type {
                     }
 
                     var record_set: RecordSet = .{
+                        .base_offset = 0,
                         .attributes = .{},
                         .base_sequence = -1,
                         .base_timestamp = timestamp.toMilliseconds(),
